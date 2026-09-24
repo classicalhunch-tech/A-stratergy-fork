@@ -1,0 +1,572 @@
+{
+  "metadata": {
+    "purpose": "Primary Phase 2 parameter-sensitivity trial registry for DSR/PBO overfit diagnostics.",
+    "trial_design": "One-at-a-time parameter sensitivity across Parameters A, B, C, D; no Cartesian grid.",
+    "baseline": {
+      "max_bars_to_retest": 20,
+      "reward_multiple": 2.0,
+      "stop_buffer": 0.0,
+      "entry_mode": "midpoint"
+    },
+    "primary_axes": {
+      "max_bars_to_retest": [
+        10,
+        15,
+        20,
+        25,
+        30
+      ],
+      "reward_multiple": [
+        1.5,
+        1.75,
+        2.0,
+        2.25,
+        2.5
+      ],
+      "stop_buffer": [
+        0.0,
+        0.0001,
+        0.0002,
+        0.0003,
+        0.0004,
+        0.0005
+      ],
+      "entry_mode": [
+        "midpoint",
+        "extreme"
+      ]
+    },
+    "known_confounds": {
+      "entry_mode=extreme": "entry_mode='extreme' internally forces stop_buffer=0.01 when stop_buffer <= 0 (per signal engine behavior documented in the Phase 2 record). This trial therefore also changes the effective stop_buffer -- it is not an isolated single-variable change from baseline."
+    },
+    "excluded_diagnostics": {
+      "stop_buffer_flip_diagnostic": {
+        "reason": "The trade-by-trade WIN/LOSS flip investigation (stop_buffer_diagnostic.py's pairwise comparison at 0.0 vs 0.0005) is a deeper investigation OF an already-included primary trial result, not a new configuration in its own right. The six stop_buffer sweep VALUES themselves ARE included as primary trials above -- only this follow-up diagnostic is excluded."
+      },
+      "transaction_cost_stress": {
+        "reason": "Transaction-cost assumptions applied to completed trades; not alternative strategy configurations."
+      },
+      "walk_forward_sensitivity": {
+        "reason": "Temporal validation sensitivity (warmup/window/step); evaluated separately from parameter-search trials."
+      }
+    },
+    "dataset": "your_data_file.csv",
+    "dataset_type": "Synthetic M5 EURUSD-like random walk.",
+    "strategy_modified": false,
+    "canonical_backtest_used": true,
+    "n_primary_trials": 15
+  },
+  "trials": [
+    {
+      "trial_id": 1,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "baseline",
+      "changed_parameter": null,
+      "is_baseline": true,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 1.25,
+      "std_r": 1.3416407864998738,
+      "sharpe": 0.9316949906249123,
+      "r_multiples": [
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 2,
+      "config": {
+        "max_bars_to_retest": 10,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 14,
+      "expectancy_r": 1.3571428571428572,
+      "std_r": 1.2774459408789602,
+      "sharpe": 1.062387701673748,
+      "r_multiples": [
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 3,
+      "config": {
+        "max_bars_to_retest": 15,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 1.25,
+      "std_r": 1.3416407864998738,
+      "sharpe": 0.9316949906249123,
+      "r_multiples": [
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 4,
+      "config": {
+        "max_bars_to_retest": 25,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 17,
+      "expectancy_r": 1.1176470588235294,
+      "std_r": 1.4090046549415864,
+      "sharpe": 0.7932174353745226,
+      "r_multiples": [
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 5,
+      "config": {
+        "max_bars_to_retest": 30,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 17,
+      "expectancy_r": 1.1176470588235294,
+      "std_r": 1.4090046549415864,
+      "sharpe": 0.7932174353745226,
+      "r_multiples": [
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 6,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 1.5,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 0.8749999999999091,
+      "std_r": 1.1180339887498407,
+      "sharpe": 0.782623792124883,
+      "r_multiples": [
+        1.5,
+        1.4999999999996507,
+        1.5000000000002516,
+        -1.0,
+        -1.0,
+        1.4999999999994833,
+        1.5000000000007316,
+        1.5000000000002804,
+        1.4999999999995564,
+        -1.0,
+        1.5,
+        1.5,
+        1.5,
+        1.4999999999985916,
+        -1.0,
+        1.5
+      ]
+    },
+    {
+      "trial_id": 7,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 1.75,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 1.0624999999999925,
+      "std_r": 1.2298373876248798,
+      "sharpe": 0.8639353549430976,
+      "r_multiples": [
+        1.7499999999993052,
+        1.7499999999998253,
+        1.7500000000001257,
+        -1.0,
+        -1.0,
+        1.7499999999997415,
+        1.7500000000003657,
+        1.7499999999998597,
+        1.7499999999997782,
+        -1.0,
+        1.75,
+        1.750000000000668,
+        1.75,
+        1.7499999999992957,
+        -1.0,
+        1.7500000000009144
+      ]
+    },
+    {
+      "trial_id": 8,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.25,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 1.0312500000000016,
+      "std_r": 1.6250000000000013,
+      "sharpe": 0.634615384615385,
+      "r_multiples": [
+        2.250000000000695,
+        2.2500000000001745,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.2500000000002585,
+        2.249999999999634,
+        2.2500000000001403,
+        -1.0,
+        -1.0,
+        2.25,
+        2.249999999999332,
+        2.25,
+        2.2500000000007043,
+        -1.0,
+        2.2499999999990856
+      ]
+    },
+    {
+      "trial_id": 9,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.5,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 1.187500000000079,
+      "std_r": 1.750000000000063,
+      "sharpe": 0.6785714285714493,
+      "r_multiples": [
+        2.5,
+        2.5000000000003495,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.500000000000517,
+        2.4999999999992686,
+        2.4999999999997193,
+        -1.0,
+        -1.0,
+        2.5,
+        2.5,
+        2.5,
+        2.5000000000014087,
+        -1.0,
+        2.5
+      ]
+    },
+    {
+      "trial_id": 10,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0001,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 0.6875,
+      "std_r": 1.5370426148939398,
+      "sharpe": 0.44728753343474437,
+      "r_multiples": [
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 11,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0002,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 0.5,
+      "std_r": 1.5491933384829668,
+      "sharpe": 0.3227486121839514,
+      "r_multiples": [
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        2.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 12,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0003,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 0.125,
+      "std_r": 1.5,
+      "sharpe": 0.08333333333333333,
+      "r_multiples": [
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 13,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0004,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": 0.125,
+      "std_r": 1.5,
+      "sharpe": 0.08333333333333333,
+      "r_multiples": [
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 14,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0005,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "is_baseline": false,
+      "confound": null,
+      "n_closed_trades": 16,
+      "expectancy_r": -0.0625,
+      "std_r": 1.4361406616345072,
+      "sharpe": -0.04351941398892446,
+      "r_multiples": [
+        -1.0,
+        2.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        2.0,
+        2.0,
+        -1.0,
+        2.0,
+        -1.0,
+        2.0
+      ]
+    },
+    {
+      "trial_id": 15,
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "extreme"
+      },
+      "source_axis": "entry_mode",
+      "changed_parameter": "entry_mode",
+      "is_baseline": false,
+      "confound": "entry_mode='extreme' internally forces stop_buffer=0.01 when stop_buffer <= 0 (per signal engine behavior documented in the Phase 2 record). This trial therefore also changes the effective stop_buffer -- it is not an isolated single-variable change from baseline.",
+      "n_closed_trades": 2,
+      "expectancy_r": -1.0,
+      "std_r": 0.0,
+      "sharpe": 0.0,
+      "r_multiples": [
+        -1.0,
+        -1.0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+"""
+phase_03_paper/tests/test_event_collector_smoke.py
+
+Smoke test for event_collector.run_historical_replay_with_events().
+
+PURPOSE
+-------
+Confirms the event collector, run against the SAME real 500-candle
+dataset and SAME wiring as test_full_replay_integration.py, produces
+an event log that is CONSISTENT with what that already-passing test
+proved about this dataset:
+
+    Opened trades   : 0
+    Closed trades   : 0
+    Pending signals : 1
+
+If the collector's event counts do not match those already-confirmed
+numbers, that means the collector itself has a bug -- it must NEVER
+report a different reality than the real pipeline already produced.
+
+This test does not invent new assertions about strategy behavior; it
+only asserts that observation matches reality.
+
+HOW TO ADAPT THIS FILE
+------------------------
+This file assumes the same coordinator_factory / paper_engine wiring
+used in test_full_replay_integration.py. Copy the real wiring from
+that file's setUp/coordinator_factory into the TODO block below --
+it is intentionally left as a clearly marked placeholder here because
+the exact real signature of that wiring was not available when this
+file was written, and guessing it would risk a false pass/fail.
+"""
+
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+from phase_03_paper.replay.event_collector import (
+    ReplayEventType,
+    run_historical_replay_with_events,
+)
+
+# TODO: import whatever test_full_replay_integration.py imports to build
+# a real coordinator_factory and paper_engine (SessionEngine,
+# NotificationEngine, StrategyAdapter, PaperTradeEngine, Journal,
+# MonitoringEngine, PerformanceEngine, DEFAULT_CONFIG, etc).
+#
+# The cleanest approach: open phase_03_paper/tests/test_full_replay_integration.py,
+# copy its coordinator_factory + paper_engine construction verbatim into
+# _build_wiring() below, unchanged. This test intentionally does not
+# duplicate strategy/session/adapter construction logic on its own.
+
+
+def _build_wiring():
+    """
+    Returns (coordinator_factory, paper_engine, journal).
+
+    TODO: replace this body with the exact real wiring copied from
+    test_full_replay_integration.py so both tests run against
+    identical, real configuration.
+    """
+    raise NotImplementedError(
+        "Copy the real coordinator_factory/paper_engine/journal wiring "
+        "from phase_03_paper/tests/test_full_replay_integration.py here."
+    )
+
+
+class TestEventCollectorSmoke(unittest.TestCase):
+    def test_event_log_matches_known_replay_result(self) -> None:
+        csv_path = str(
+            Path(__file__).resolve().parents[2] / "your_data_file.csv"
+        )
+
+        coordinator_factory, paper_engine, journal = _build_wiring()
+
+        summary = run_historical_replay_with_events(
+            csv_path,
+            coordinator_factory=coordinator_factory,
+            paper_engine=paper_engine,
+            journal=journal,
+        )
+
+        print("=" * 70)
+        print("EVENT COLLECTOR SMOKE TEST")
+        print("=" * 70)
+        print(f"Total candles      : {summary.total_candles}")
+        print(f"Ticks run          : {summary.ticks_run}")
+        print(f"Opened trades      : {summary.opened_trades}")
+        print(f"Closed trades      : {summary.closed_trades}")
+        print(f"Event log size     : {summary.event_log.event_count}")
+        print(f"  TRADE_OPENED     : {summary.event_log.opened_trade_count}")
+        print(f"  TRADE_CLOSED     : {summary.event_log.closed_trade_count}")
+        print(f"  JOURNAL_ENTRY    : {summary.event_log.journal_entry_count}")
+        print("=" * 70)
+
+        # ------------------------------------------------------------
+        # Known-good numbers from test_full_replay_integration.py on
+        # this exact dataset: 500 candles, 0 opened, 0 closed, 1
+        # pending signal. The collector must agree with this, or the
+        # collector itself is broken -- not the strategy.
+        # ------------------------------------------------------------
+
+        self.assertEqual(summary.total_candles, 500)
+        self.assertEqual(summary.ticks_run, 500)
+        self.assertEqual(summary.opened_trades, 0)
+        self.assertEqual(summary.closed_trades, 0)
+
+        # Event counts must be internally consistent with the summary
+        # counters -- these are two independent code paths counting
+        # the same real trades, so they must always agree.
+        self.assertEqual(
+            summary.event_log.opened_trade_count, summary.opened_trades
+        )
+        self.assertEqual(
+            summary.event_log.closed_trade_count, summary.closed_trades
+        )
+
+        # With zero opened trades, there must be zero JOURNAL_ENTRY
+        # events too (nothing ever became OPEN/MANAGED/CLOSED).
+        self.assertEqual(summary.event_log.journal_entry_count, 0)
+
+        # Every event in the log must be one of the three known types
+        # -- guards against a future bug silently introducing a new,
+        # unhandled event type.
+        for event in summary.event_log.all_events():
+            self.assertIn(
+                event.event_type,
+                (
+                    ReplayEventType.TRADE_OPENED,
+                    ReplayEventType.TRADE_CLOSED,
+                    ReplayEventType.JOURNAL_ENTRY,
+                ),
+            )
+            self.assertIsNotNone(event.timestamp)
+
+
+if __name__ == "__main__":
+    unittest.main()

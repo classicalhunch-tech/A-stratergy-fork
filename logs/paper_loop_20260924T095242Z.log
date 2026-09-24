@@ -1,0 +1,17 @@
+[restart] safe_to_proceed=True
+[restart] kill_switch_engaged_by_this_restart=False
+[startup] symbol=XAUUSD timeframe=M5 dry_run=True
+[startup] entering candle loop...
+[risk-config] fixed_lot_size changed to 0.03
+[risk-config] fixed_lot_size changed to 0.02
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Administrator\Desktop\spreadsheet_bot\phase_04_live\runtime\loop.py", line 513, in <module>
+    run_live_loop(
+  File "C:\Users\Administrator\Desktop\spreadsheet_bot\phase_04_live\runtime\loop.py", line 289, in run_live_loop
+    for raw_candle in market_source.stream():
+                      ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\spreadsheet_bot\phase_04_live\market\live_source.py", line 168, in stream
+    time.sleep(self.poll_interval_seconds)
+KeyboardInterrupt

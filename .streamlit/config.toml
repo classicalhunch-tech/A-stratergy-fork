@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+primaryColor = "#3B82F6"        # accent blue — buttons, active tab, links
+backgroundColor = "#0E1117"     # main app background
+secondaryBackgroundColor = "#161B22"  # containers, sidebar, widgets
+textColor = "#E6E6E6"
+font = "sans serif"

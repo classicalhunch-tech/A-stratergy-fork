@@ -1,0 +1,352 @@
+{
+  "version": 1,
+  "dataset": "your_data_file.csv",
+  "cscv_blocks": 10,
+  "trials": {
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "baseline",
+      "changed_parameter": null,
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        1.0,
+        1.0,
+        6.0,
+        3.0,
+        2.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":10,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 10,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        1.0,
+        1.0,
+        4.0,
+        3.0,
+        2.0,
+        4.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":15,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 15,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        1.0,
+        1.0,
+        6.0,
+        3.0,
+        2.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":25,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 25,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        1.0,
+        1.0,
+        6.0,
+        3.0,
+        2.0,
+        2.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":30,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 30,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "max_bars_to_retest",
+      "changed_parameter": "max_bars_to_retest",
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        1.0,
+        1.0,
+        6.0,
+        3.0,
+        2.0,
+        2.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":1.5,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 1.5,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "confound": null,
+      "block_totals": [
+        2.999999999999651,
+        0.0,
+        0.5000000000002516,
+        0.4999999999994833,
+        4.500000000000568,
+        2.0,
+        1.5,
+        1.9999999999985916,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":1.75,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 1.75,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "confound": null,
+      "block_totals": [
+        3.4999999999991305,
+        0.0,
+        0.7500000000001257,
+        0.7499999999997415,
+        5.2500000000000036,
+        2.500000000000668,
+        1.75,
+        2.50000000000021,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.25,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.25,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "confound": null,
+      "block_totals": [
+        4.5000000000008695,
+        0.0,
+        -2.0,
+        1.2500000000002585,
+        3.4999999999997744,
+        3.499999999999332,
+        2.25,
+        3.49999999999979,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.5,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.5,
+        "stop_buffer": 0.0,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "reward_multiple",
+      "changed_parameter": "reward_multiple",
+      "confound": null,
+      "block_totals": [
+        5.00000000000035,
+        0.0,
+        -2.0,
+        1.500000000000517,
+        3.9999999999989875,
+        4.0,
+        2.5,
+        4.000000000001409,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0001}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0001,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "confound": null,
+      "block_totals": [
+        4.0,
+        0.0,
+        -2.0,
+        -2.0,
+        3.0,
+        3.0,
+        2.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0002}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0002,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "confound": null,
+      "block_totals": [
+        1.0,
+        0.0,
+        -2.0,
+        -2.0,
+        3.0,
+        3.0,
+        -1.0,
+        6.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0003}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0003,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "confound": null,
+      "block_totals": [
+        1.0,
+        0.0,
+        -2.0,
+        -2.0,
+        0.0,
+        3.0,
+        -1.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0004}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0004,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "confound": null,
+      "block_totals": [
+        1.0,
+        0.0,
+        -2.0,
+        -2.0,
+        0.0,
+        3.0,
+        -1.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"midpoint\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0005}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0005,
+        "entry_mode": "midpoint"
+      },
+      "source_axis": "stop_buffer",
+      "changed_parameter": "stop_buffer",
+      "confound": null,
+      "block_totals": [
+        1.0,
+        0.0,
+        -2.0,
+        -2.0,
+        -3.0,
+        3.0,
+        -1.0,
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    "{\"entry_mode\":\"extreme\",\"max_bars_to_retest\":20,\"reward_multiple\":2.0,\"stop_buffer\":0.0}": {
+      "config": {
+        "max_bars_to_retest": 20,
+        "reward_multiple": 2.0,
+        "stop_buffer": 0.0,
+        "entry_mode": "extreme"
+      },
+      "source_axis": "entry_mode",
+      "changed_parameter": "entry_mode",
+      "confound": "entry_mode='extreme' internally forces stop_buffer=0.01 when stop_buffer <= 0 (per signal engine behavior documented in the Phase 2 record). This trial therefore also changes the effective stop_buffer -- it is not an isolated single-variable change from baseline.",
+      "block_totals": [
+        -2.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  }
+}
