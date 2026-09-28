@@ -1,0 +1,3607 @@
+﻿
+================================================================
+FILE: .\strategy\swings.py
+================================================================
+"""
+strategy/swings.py
+
+Swing detection: identifies confirmed structural swing highs and lows
+from OHLC data, used as the foundation for market structure analysis.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+import pandas as pd
+
+
+class SwingType(Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+
+
+@dataclass
+class Swing:
+    swing_type: SwingType
+    price: float
+    formed_at: pd.Timestamp
+    confirmed_at: pd.Timestamp
+
+
+def find_swings(df: pd.DataFrame) -> list:
+    """
+    Detect confirmed structural swing highs and lows.
+    Accepts DataFrame with either capitalized or lower-case OHLC columns.
+
+    Raises:
+        ValueError: if required OHLC columns are missing, if the index
+            is not a DatetimeIndex, or if NaNs are present in high/low/close.
+
+    NOTE: This function is unchanged. It remains the correctness
+    reference that SwingState (below) is validated against. Do not
+    modify this function as part of any incremental-state work --
+    if the two ever disagree, this function is assumed correct and
+    SwingState has a bug.
+    """
+    if df.empty or len(df) < 2:
+        return []
+
+    df_copy = df.copy()
+    df_copy.columns = [col.lower() for col in df_copy.columns]
+
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(df_copy.columns):
+        raise ValueError(
+            f"Missing required columns: {required - set(df_copy.columns)}"
+        )
+
+    if not isinstance(df_copy.index, pd.DatetimeIndex):
+        raise ValueError(
+            "find_swings requires a DatetimeIndex -- got "
+            f"{type(df_copy.index).__name__}. Swing.formed_at/confirmed_at "
+            "depend on real timestamps for downstream structure analysis."
+        )
+
+    if df_copy[["high", "low", "close"]].isna().any().any():
+        raise ValueError(
+            "find_swings received NaN values in high/low/close columns. "
+            "Clean or interpolate the input data before swing detection."
+        )
+
+    # sort_index() already returns a fresh copy -- no need for an extra
+    # .copy() before it (avoids a redundant full-DataFrame allocation).
+    df_copy = df_copy.sort_index()
+
+    swings = []
+
+    # Convert once to raw NumPy arrays -- avoids all pandas per-call
+    # accessor overhead.
+    index_vals = df_copy.index
+    highs = df_copy["high"].to_numpy()
+    lows = df_copy["low"].to_numpy()
+    closes = df_copy["close"].to_numpy()
+
+    first_high = highs[0]
+    first_low = lows[0]
+
+    candidate_high = first_high
+    candidate_high_time = index_vals[0]
+    candidate_low = first_low
+    candidate_low_time = index_vals[0]
+
+    mode = "initial"
+    pullback_low = None
+    pullback_low_time = None
+    pullback_high = None
+    pullback_high_time = None
+
+    n = len(df_copy)
+
+    for i in range(1, n):
+        ts = index_vals[i]
+        high = highs[i]
+        low = lows[i]
+        close = closes[i]
+
+        if mode == "initial":
+            if close > first_high:
+                candidate_low = low
+                candidate_low_time = ts
+                pullback_high = None
+                pullback_high_time = None
+                mode = "seeking_low"
+                continue
+            if close < first_low:
+                candidate_high = high
+                candidate_high_time = ts
+                pullback_low = None
+                pullback_low_time = None
+                mode = "seeking_high"
+                continue
+            continue
+
+        if mode == "seeking_high":
+            if pullback_low is not None and close < pullback_low:
+                swings.append(
+                    Swing(
+                        swing_type=SwingType.HIGH,
+                        price=candidate_high,
+                        formed_at=candidate_high_time,
+                        confirmed_at=ts,
+                    )
+                )
+                candidate_low = low
+                candidate_low_time = ts
+                pullback_high = None
+                pullback_high_time = None
+                mode = "seeking_low"
+                continue
+            if high > candidate_high:
+                candidate_high = high
+                candidate_high_time = ts
+                pullback_low = None
+                pullback_low_time = None
+            else:
+                if pullback_low is None or low < pullback_low:
+                    pullback_low = low
+                    pullback_low_time = ts
+            continue
+
+        if mode == "seeking_low":
+            if pullback_high is not None and close > pullback_high:
+                swings.append(
+                    Swing(
+                        swing_type=SwingType.LOW,
+                        price=candidate_low,
+                        formed_at=candidate_low_time,
+                        confirmed_at=ts,
+                    )
+                )
+                candidate_high = high
+                candidate_high_time = ts
+                pullback_low = None
+                pullback_low_time = None
+                mode = "seeking_high"
+                continue
+            if low < candidate_low:
+                candidate_low = low
+                candidate_low_time = ts
+                pullback_high = None
+                pullback_high_time = None
+            else:
+                if pullback_high is None or high > pullback_high:
+                    pullback_high = high
+                    pullback_high_time = ts
+            continue
+
+    return swings
+
+
+# ============================================================
+# INCREMENTAL SWING STATE (new -- added, does not replace
+# find_swings() above)
+# ============================================================
+#
+# SwingState carries forward exactly the loop-local variables
+# find_swings() re-derives from scratch on every call. find_swings()
+# is a pure forward-only state machine: at row i it only ever reads
+# state carried from row i-1, never an earlier row directly, never a
+# later row. That makes feeding it one new candle at a time through
+# .step() provably equivalent to re-running the whole loop -- not a
+# guess, a direct reading of the existing loop body, reproduced
+# unchanged below inside step().
+#
+# WARNING: This class intentionally skips the whole-DataFrame
+# validation find_swings() performs (missing columns, DatetimeIndex
+# check, NaN check). Callers feed it individual, already-validated
+# candle fields. If per-candle validation is needed, add it at the
+# call site, not inside step().
+#
+# CORRECTNESS REQUIREMENT: verified by
+# phase_02_optimization/test_swing_state_equivalence.py before any
+# adapter change is made. Do not assume equivalence from reading the
+# code alone.
+# ============================================================
+
+
+class SwingState:
+    """
+    Incremental, causal swing detector.
+
+    Feed candles one at a time via step(). Internally reproduces the
+    find_swings() loop body exactly, carrying state across calls
+    instead of rebuilding it from the full history each time.
+    """
+
+    def __init__(self) -> None:
+        self._initialized = False
+
+        self.mode = "initial"
+
+        self.first_high: Optional[float] = None
+        self.first_low: Optional[float] = None
+
+        self.candidate_high: Optional[float] = None
+        self.candidate_high_time = None
+        self.candidate_low: Optional[float] = None
+        self.candidate_low_time = None
+
+        self.pullback_high: Optional[float] = None
+        self.pullback_high_time = None
+        self.pullback_low: Optional[float] = None
+        self.pullback_low_time = None
+
+    def step(
+        self,
+        ts: pd.Timestamp,
+        high: float,
+        low: float,
+        close: float,
+    ) -> Optional[Swing]:
+        """
+        Process exactly one new causal candle.
+
+        Returns a newly confirmed Swing if this candle confirmed one,
+        otherwise None. Mirrors find_swings()'s loop body exactly --
+        at most one Swing can be confirmed per candle.
+        """
+
+        if not self._initialized:
+            self.first_high = high
+            self.first_low = low
+            self.candidate_high = high
+            self.candidate_high_time = ts
+            self.candidate_low = low
+            self.candidate_low_time = ts
+            self._initialized = True
+            return None
+
+        if self.mode == "initial":
+            if close > self.first_high:
+                self.candidate_low = low
+                self.candidate_low_time = ts
+                self.pullback_high = None
+                self.pullback_high_time = None
+                self.mode = "seeking_low"
+                return None
+            if close < self.first_low:
+                self.candidate_high = high
+                self.candidate_high_time = ts
+                self.pullback_low = None
+                self.pullback_low_time = None
+                self.mode = "seeking_high"
+                return None
+            return None
+
+        if self.mode == "seeking_high":
+            if (
+                self.pullback_low is not None
+                and close < self.pullback_low
+            ):
+                confirmed = Swing(
+                    swing_type=SwingType.HIGH,
+                    price=self.candidate_high,
+                    formed_at=self.candidate_high_time,
+                    confirmed_at=ts,
+                )
+                self.candidate_low = low
+                self.candidate_low_time = ts
+                self.pullback_high = None
+                self.pullback_high_time = None
+                self.mode = "seeking_low"
+                return confirmed
+
+            if high > self.candidate_high:
+                self.candidate_high = high
+                self.candidate_high_time = ts
+                self.pullback_low = None
+                self.pullback_low_time = None
+            else:
+                if (
+                    self.pullback_low is None
+                    or low < self.pullback_low
+                ):
+                    self.pullback_low = low
+                    self.pullback_low_time = ts
+            return None
+
+        if self.mode == "seeking_low":
+            if (
+                self.pullback_high is not None
+                and close > self.pullback_high
+            ):
+                confirmed = Swing(
+                    swing_type=SwingType.LOW,
+                    price=self.candidate_low,
+                    formed_at=self.candidate_low_time,
+                    confirmed_at=ts,
+                )
+                self.candidate_high = high
+                self.candidate_high_time = ts
+                self.pullback_low = None
+                self.pullback_low_time = None
+                self.mode = "seeking_high"
+                return confirmed
+
+            if low < self.candidate_low:
+                self.candidate_low = low
+                self.candidate_low_time = ts
+                self.pullback_high = None
+                self.pullback_high_time = None
+            else:
+                if (
+                    self.pullback_high is None
+                    or high > self.pullback_high
+                ):
+                    self.pullback_high = high
+                    self.pullback_high_time = ts
+            return None
+
+        # Unreachable: mode is always one of the three above.
+        return None
+
+================================================================
+FILE: .\strategy\structure.py
+================================================================
+"""
+strategy/structure.py
+
+Consumes confirmed Swings from strategy/swings.py and OHLC candles to track:
+1. Swing Classifications: HH, HL, LH, LL
+2. Trend Direction: BULLISH, BEARISH, UNKNOWN
+3. Structural Breaks: INITIAL_BREAK, BOS (Continuation), and CHOCH (Reversal)
+   with explicit protected swing boundaries and active BOS levels.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Optional, Tuple, Set
+
+import pandas as pd
+
+from strategy.swings import SwingType, Swing
+
+
+class Trend(Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    UNKNOWN = "unknown"
+
+
+class BreakType(Enum):
+    INITIAL_BREAK = "initial_break"
+    BOS = "bos"
+    CHOCH = "choch"
+
+
+class SwingLabel(Enum):
+    INITIAL_HIGH = "INITIAL_HIGH"
+    INITIAL_LOW = "INITIAL_LOW"
+    HH = "HH"
+    LH = "LH"
+    HL = "HL"
+    LL = "LL"
+
+
+@dataclass
+class ClassifiedSwing:
+    swing: Swing
+    label: SwingLabel
+
+    def __repr__(self):
+        return (
+            f"{self.label.value}("
+            f"{self.swing.swing_type.value}, "
+            f"price={self.swing.price})"
+        )
+
+
+@dataclass
+class StructureBreak:
+    break_type: BreakType
+    direction: Trend
+    broken_swing: Swing
+    broken_at: pd.Timestamp
+    break_price: float
+
+    def __repr__(self):
+        return (
+            f"StructureBreak("
+            f"{self.break_type.value}, "
+            f"direction={self.direction.value}, "
+            f"level={self.broken_swing.price}, "
+            f"broken_at={self.broken_at.strftime('%m-%d %H:%M')})"
+        )
+
+
+def analyze_structure(
+    df: pd.DataFrame,
+    swings: list,
+) -> Tuple[List[StructureBreak], List[ClassifiedSwing], Trend]:
+    """
+    Evaluates candle data against confirmed swings using explicit structural
+    boundaries, tracking active BOS levels and protected CHOCH reversal levels.
+    """
+
+    if df.empty or not swings:
+        return [], [], Trend.UNKNOWN
+
+    df_copy = df.copy()
+    df_copy.columns = [c.lower() for c in df_copy.columns]
+    df_copy = df_copy.sort_index()
+
+    breaks: List[StructureBreak] = []
+    classified_swings: List[ClassifiedSwing] = []
+    current_trend = Trend.UNKNOWN
+
+    # Explicit structural boundary markers.
+    active_bos_swing: Optional[Swing] = None
+    protected_swing: Optional[Swing] = None
+
+    last_high: Optional[Swing] = None
+    last_low: Optional[Swing] = None
+
+    swings_sorted = sorted(swings, key=lambda s: s.confirmed_at)
+    next_swing_idx = 0
+
+    consumed_swings: Set[
+        Tuple[SwingType, float, pd.Timestamp]
+    ] = set()
+
+    def get_swing_key(sw: Swing):
+        return (
+            sw.swing_type,
+            sw.price,
+            sw.confirmed_at,
+        )
+
+    def record_break(
+        break_type,
+        direction,
+        broken_swing,
+        ts,
+        close,
+    ):
+        """Append a StructureBreak and mark its level as consumed."""
+
+        breaks.append(
+            StructureBreak(
+                break_type=break_type,
+                direction=direction,
+                broken_swing=broken_swing,
+                broken_at=ts,
+                break_price=close,
+            )
+        )
+
+        consumed_swings.add(
+            get_swing_key(broken_swing)
+        )
+
+    # PERFORMANCE OPTIMIZATION:
+    # Use itertuples() instead of iterrows() to reduce pandas Series
+    # overhead during large backtest scans.
+    for row in df_copy.itertuples():
+
+        ts = row.Index
+        close = row.close
+
+        # ------------------------------------------------------------
+        # 1. Unlock and classify confirmed swings.
+        # ------------------------------------------------------------
+        while (
+            next_swing_idx < len(swings_sorted)
+            and swings_sorted[next_swing_idx].confirmed_at <= ts
+        ):
+            sw = swings_sorted[next_swing_idx]
+
+            if sw.swing_type == SwingType.HIGH:
+
+                if last_high is None:
+                    lbl = SwingLabel.INITIAL_HIGH
+                elif sw.price > last_high.price:
+                    lbl = SwingLabel.HH
+                else:
+                    lbl = SwingLabel.LH
+
+                last_high = sw
+
+                # In bearish structure, only tighten the protected
+                # ceiling. A higher high must not weaken it.
+                if current_trend == Trend.BEARISH:
+                    if (
+                        protected_swing is None
+                        or sw.price < protected_swing.price
+                    ):
+                        protected_swing = sw
+
+            else:
+
+                if last_low is None:
+                    lbl = SwingLabel.INITIAL_LOW
+                elif sw.price < last_low.price:
+                    lbl = SwingLabel.LL
+                else:
+                    lbl = SwingLabel.HL
+
+                last_low = sw
+
+                # In bullish structure, only raise the protected
+                # floor. A lower low must not weaken it.
+                if current_trend == Trend.BULLISH:
+                    if (
+                        protected_swing is None
+                        or sw.price > protected_swing.price
+                    ):
+                        protected_swing = sw
+
+            classified_swings.append(
+                ClassifiedSwing(
+                    swing=sw,
+                    label=lbl,
+                )
+            )
+
+            next_swing_idx += 1
+
+            # Track the furthest structural extreme in the current
+            # trend direction as the active BOS target.
+            if (
+                current_trend == Trend.BULLISH
+                and sw.swing_type == SwingType.HIGH
+            ):
+                if (
+                    active_bos_swing is None
+                    or sw.price > active_bos_swing.price
+                ):
+                    active_bos_swing = sw
+
+            elif (
+                current_trend == Trend.BEARISH
+                and sw.swing_type == SwingType.LOW
+            ):
+                if (
+                    active_bos_swing is None
+                    or sw.price < active_bos_swing.price
+                ):
+                    active_bos_swing = sw
+
+        # ------------------------------------------------------------
+        # 2. Evaluate this candle for a structural break.
+        # ------------------------------------------------------------
+        if current_trend == Trend.UNKNOWN:
+
+            # First bullish structural break.
+            if (
+                last_high
+                and get_swing_key(last_high)
+                not in consumed_swings
+                and close > last_high.price
+            ):
+                record_break(
+                    BreakType.INITIAL_BREAK,
+                    Trend.BULLISH,
+                    last_high,
+                    ts,
+                    close,
+                )
+
+                current_trend = Trend.BULLISH
+                active_bos_swing = last_high
+                protected_swing = last_low
+
+            # First bearish structural break.
+            elif (
+                last_low
+                and get_swing_key(last_low)
+                not in consumed_swings
+                and close < last_low.price
+            ):
+                record_break(
+                    BreakType.INITIAL_BREAK,
+                    Trend.BEARISH,
+                    last_low,
+                    ts,
+                    close,
+                )
+
+                current_trend = Trend.BEARISH
+                active_bos_swing = last_low
+                protected_swing = last_high
+
+        elif current_trend == Trend.BULLISH:
+
+            # CHOCH:
+            # Close below the protected bullish swing.
+            if (
+                protected_swing
+                and get_swing_key(protected_swing)
+                not in consumed_swings
+                and close < protected_swing.price
+            ):
+                record_break(
+                    BreakType.CHOCH,
+                    Trend.BEARISH,
+                    protected_swing,
+                    ts,
+                    close,
+                )
+
+                current_trend = Trend.BEARISH
+                active_bos_swing = last_low
+                protected_swing = last_high
+
+            # BOS:
+            # Close above the active bullish structural high.
+            elif (
+                active_bos_swing
+                and get_swing_key(active_bos_swing)
+                not in consumed_swings
+                and close > active_bos_swing.price
+            ):
+                record_break(
+                    BreakType.BOS,
+                    Trend.BULLISH,
+                    active_bos_swing,
+                    ts,
+                    close,
+                )
+
+                # IMPORTANT:
+                # Do not reassign active_bos_swing to last_high here.
+                # The broken swing is consumed. The next confirmed
+                # structural high must promote the BOS target naturally.
+
+        elif current_trend == Trend.BEARISH:
+
+            # CHOCH:
+            # Close above the protected bearish swing.
+            if (
+                protected_swing
+                and get_swing_key(protected_swing)
+                not in consumed_swings
+                and close > protected_swing.price
+            ):
+                record_break(
+                    BreakType.CHOCH,
+                    Trend.BULLISH,
+                    protected_swing,
+                    ts,
+                    close,
+                )
+
+                current_trend = Trend.BULLISH
+                active_bos_swing = last_high
+                protected_swing = last_low
+
+            # BOS:
+            # Close below the active bearish structural low.
+            elif (
+                active_bos_swing
+                and get_swing_key(active_bos_swing)
+                not in consumed_swings
+                and close < active_bos_swing.price
+            ):
+                record_break(
+                    BreakType.BOS,
+                    Trend.BEARISH,
+                    active_bos_swing,
+                    ts,
+                    close,
+                )
+
+                # IMPORTANT:
+                # Do not reassign active_bos_swing to last_low here.
+                # The next confirmed structural low must promote the
+                # target naturally.
+
+    return breaks, classified_swings, current_trend
+
+
+# ============================================================
+# INCREMENTAL STRUCTURE STATE
+# ============================================================
+#
+# StructureState: incremental, causal structure tracker.
+#
+# analyze_structure() above is UNCHANGED and remains the
+# correctness reference. StructureState re-implements its exact
+# loop body, but keeps state (current_trend, active_bos_swing,
+# protected_swing, last_high, last_low, next_swing_idx,
+# consumed_swings, classified_swings, breaks) persisted across
+# step() calls instead of rebuilt from scratch on every call --
+# same pattern as SwingState in strategy/swings.py.
+#
+# StructureState.step() is only proven correct when:
+#   1. Rows are fed in strictly increasing chronological order.
+#   2. Each row is fed exactly once.
+#   3. New confirmed swings are fed via add_swings() in
+#      confirmed_at order, at or before the row whose timestamp
+#      reaches them -- matching how analyze_structure() unlocks
+#      swings via its own next_swing_idx loop above.
+#
+# Equivalence to analyze_structure() is proven by
+# phase_02_optimization/test_structure_state_equivalence.py.
+# ============================================================
+
+
+def _get_swing_key(sw: Swing) -> Tuple[SwingType, float, pd.Timestamp]:
+    return (sw.swing_type, sw.price, sw.confirmed_at)
+
+
+@dataclass
+class StructureState:
+    """
+    Incremental equivalent of analyze_structure(). Feed rows one at a
+    time via step(); feed newly confirmed swings via add_swings()
+    before the step() call for the row that should unlock them.
+    """
+
+    current_trend: Trend = Trend.UNKNOWN
+
+    active_bos_swing: Optional[Swing] = None
+    protected_swing: Optional[Swing] = None
+
+    last_high: Optional[Swing] = None
+    last_low: Optional[Swing] = None
+
+    # Growing, confirmed_at-ordered list of swings seen so far.
+    # New swings are expected to be appended in non-decreasing
+    # confirmed_at order (guaranteed by SwingState's causal feed),
+    # so this never needs re-sorting.
+    _swings_sorted: List[Swing] = field(default_factory=list)
+    _next_swing_idx: int = 0
+
+    _consumed_swings: Set[Tuple] = field(default_factory=set)
+
+    # Accumulated outputs, growing across the state's lifetime --
+    # same accumulate-and-return-the-whole-list pattern as
+    # StrategyAdapter._confirmed_swings / self._zones.
+    breaks: List[StructureBreak] = field(default_factory=list)
+    classified_swings: List[ClassifiedSwing] = field(default_factory=list)
+
+    def add_swings(self, new_swings: List[Swing]) -> None:
+        """
+        Append newly confirmed swings. Must be called with swings in
+        confirmed_at order, and each swing added exactly once --
+        same contract as SwingState's step() output being fed once.
+        """
+        self._swings_sorted.extend(new_swings)
+
+    def _record_break(
+        self,
+        break_type: BreakType,
+        direction: Trend,
+        broken_swing: Swing,
+        ts: pd.Timestamp,
+        close: float,
+    ) -> None:
+        self.breaks.append(
+            StructureBreak(
+                break_type=break_type,
+                direction=direction,
+                broken_swing=broken_swing,
+                broken_at=ts,
+                break_price=close,
+            )
+        )
+        self._consumed_swings.add(_get_swing_key(broken_swing))
+
+    def step(self, ts: pd.Timestamp, close: float) -> None:
+        """
+        Process exactly one new candle. Mirrors the body of
+        analyze_structure()'s per-row loop exactly, operating on
+        persisted state instead of locals rebuilt every call.
+        """
+
+        # ------------------------------------------------------------
+        # 1. Unlock and classify any swings confirmed at or before ts.
+        # ------------------------------------------------------------
+        while (
+            self._next_swing_idx < len(self._swings_sorted)
+            and self._swings_sorted[self._next_swing_idx].confirmed_at <= ts
+        ):
+            sw = self._swings_sorted[self._next_swing_idx]
+
+            if sw.swing_type == SwingType.HIGH:
+                if self.last_high is None:
+                    lbl = SwingLabel.INITIAL_HIGH
+                elif sw.price > self.last_high.price:
+                    lbl = SwingLabel.HH
+                else:
+                    lbl = SwingLabel.LH
+
+                self.last_high = sw
+
+                if self.current_trend == Trend.BEARISH:
+                    if (
+                        self.protected_swing is None
+                        or sw.price < self.protected_swing.price
+                    ):
+                        self.protected_swing = sw
+
+            else:
+                if self.last_low is None:
+                    lbl = SwingLabel.INITIAL_LOW
+                elif sw.price < self.last_low.price:
+                    lbl = SwingLabel.LL
+                else:
+                    lbl = SwingLabel.HL
+
+                self.last_low = sw
+
+                if self.current_trend == Trend.BULLISH:
+                    if (
+                        self.protected_swing is None
+                        or sw.price > self.protected_swing.price
+                    ):
+                        self.protected_swing = sw
+
+            self.classified_swings.append(
+                ClassifiedSwing(swing=sw, label=lbl)
+            )
+
+            self._next_swing_idx += 1
+
+            if (
+                self.current_trend == Trend.BULLISH
+                and sw.swing_type == SwingType.HIGH
+            ):
+                if (
+                    self.active_bos_swing is None
+                    or sw.price > self.active_bos_swing.price
+                ):
+                    self.active_bos_swing = sw
+
+            elif (
+                self.current_trend == Trend.BEARISH
+                and sw.swing_type == SwingType.LOW
+            ):
+                if (
+                    self.active_bos_swing is None
+                    or sw.price < self.active_bos_swing.price
+                ):
+                    self.active_bos_swing = sw
+
+        # ------------------------------------------------------------
+        # 2. Evaluate this candle for a structural break.
+        # ------------------------------------------------------------
+        if self.current_trend == Trend.UNKNOWN:
+
+            if (
+                self.last_high
+                and _get_swing_key(self.last_high) not in self._consumed_swings
+                and close > self.last_high.price
+            ):
+                self._record_break(
+                    BreakType.INITIAL_BREAK, Trend.BULLISH, self.last_high, ts, close
+                )
+                self.current_trend = Trend.BULLISH
+                self.active_bos_swing = self.last_high
+                self.protected_swing = self.last_low
+
+            elif (
+                self.last_low
+                and _get_swing_key(self.last_low) not in self._consumed_swings
+                and close < self.last_low.price
+            ):
+                self._record_break(
+                    BreakType.INITIAL_BREAK, Trend.BEARISH, self.last_low, ts, close
+                )
+                self.current_trend = Trend.BEARISH
+                self.active_bos_swing = self.last_low
+                self.protected_swing = self.last_high
+
+        elif self.current_trend == Trend.BULLISH:
+
+            if (
+                self.protected_swing
+                and _get_swing_key(self.protected_swing) not in self._consumed_swings
+                and close < self.protected_swing.price
+            ):
+                self._record_break(
+                    BreakType.CHOCH, Trend.BEARISH, self.protected_swing, ts, close
+                )
+                self.current_trend = Trend.BEARISH
+                self.active_bos_swing = self.last_low
+                self.protected_swing = self.last_high
+
+            elif (
+                self.active_bos_swing
+                and _get_swing_key(self.active_bos_swing) not in self._consumed_swings
+                and close > self.active_bos_swing.price
+            ):
+                self._record_break(
+                    BreakType.BOS, Trend.BULLISH, self.active_bos_swing, ts, close
+                )
+                # Do not reassign active_bos_swing here -- matches
+                # analyze_structure()'s explicit comment/behavior.
+
+        elif self.current_trend == Trend.BEARISH:
+
+            if (
+                self.protected_swing
+                and _get_swing_key(self.protected_swing) not in self._consumed_swings
+                and close > self.protected_swing.price
+            ):
+                self._record_break(
+                    BreakType.CHOCH, Trend.BULLISH, self.protected_swing, ts, close
+                )
+                self.current_trend = Trend.BULLISH
+                self.active_bos_swing = self.last_high
+                self.protected_swing = self.last_low
+
+            elif (
+                self.active_bos_swing
+                and _get_swing_key(self.active_bos_swing) not in self._consumed_swings
+                and close < self.active_bos_swing.price
+            ):
+                self._record_break(
+                    BreakType.BOS, Trend.BEARISH, self.active_bos_swing, ts, close
+                )
+                # Do not reassign active_bos_swing here -- matches
+                # analyze_structure()'s explicit comment/behavior.
+
+================================================================
+FILE: .\strategy\liquidity.py
+================================================================
+"""
+strategy/liquidity.py
+
+Liquidity Engine:
+    Detects and manages Sell-Side Liquidity (SSL) and Buy-Side Liquidity (BSL)
+    levels, tracking their lifecycle from formation to sweep.
+"""
+
+from enum import Enum
+from typing import List, Optional
+import pandas as pd
+
+from strategy.swings import Swing, SwingType
+
+
+class LiquidityType(Enum):
+    SELL_SIDE = "sell_side"  # SSL (formed at swing lows)
+    BUY_SIDE = "buy_side"    # BSL (formed at swing highs)
+
+
+class LiquidityStatus(Enum):
+    ACTIVE = "active"
+    SWEPT = "swept"
+    INVALIDATED = "invalidated"
+
+
+class LiquidityLevel:
+    """Represents a structural liquidity pool in price action."""
+
+    def __init__(
+        self,
+        liquidity_type: LiquidityType,
+        price: float,
+        formed_at: pd.Timestamp,
+        swing: Swing,
+        status: LiquidityStatus = LiquidityStatus.ACTIVE,
+        sweep_bar_index: Optional[int] = None,
+        swept_at: Optional[pd.Timestamp] = None,
+    ):
+        self.liquidity_type = liquidity_type
+        self.price = price
+        self.formed_at = formed_at
+        self.swing = swing
+        self.status = status
+        self.sweep_bar_index = sweep_bar_index
+        self.swept_at = swept_at
+
+    def __repr__(self) -> str:
+        return (
+            f"LiquidityLevel(type={self.liquidity_type.value}, "
+            f"price={self.price}, status={self.status.value}, "
+            f"formed_at={self.formed_at})"
+        )
+
+
+def detect_liquidity_levels(
+    df: pd.DataFrame,
+    swings: List[Swing],
+    lookback_bars: int = 50,
+) -> List[LiquidityLevel]:
+    """
+    Detects liquidity levels from confirmed swing points.
+
+    Args:
+        df: OHLC DataFrame indexed by timestamp (DatetimeIndex), same
+            convention as swings.py / structure.py / zones.py.
+        swings: List of Swing objects detected on the chart.
+        lookback_bars: Maximum historical window to track active liquidity.
+
+    Returns:
+        List of LiquidityLevel objects.
+    """
+    liquidity_levels = []
+
+    for swing in swings:
+        if swing.swing_type == SwingType.LOW:
+            # Swing Lows act as Sell-Side Liquidity (SSL) pools.
+            # formed_at uses confirmed_at, not formed_at on the Swing itself --
+            # a liquidity pool shouldn't exist until the swing that created it
+            # is actually confirmed (same causal principle as the rest of the
+            # pipeline: nothing is "real" before its own confirmation point).
+            liquidity_levels.append(
+                LiquidityLevel(
+                    liquidity_type=LiquidityType.SELL_SIDE,
+                    price=swing.price,
+                    formed_at=swing.confirmed_at,
+                    swing=swing,
+                    status=LiquidityStatus.ACTIVE,
+                )
+            )
+        elif swing.swing_type == SwingType.HIGH:
+            # Swing Highs act as Buy-Side Liquidity (BSL) pools
+            liquidity_levels.append(
+                LiquidityLevel(
+                    liquidity_type=LiquidityType.BUY_SIDE,
+                    price=swing.price,
+                    formed_at=swing.confirmed_at,
+                    swing=swing,
+                    status=LiquidityStatus.ACTIVE,
+                )
+            )
+
+    return liquidity_levels
+
+
+def update_liquidity_sweeps(
+    df: pd.DataFrame,
+    liquidity_levels: List[LiquidityLevel],
+) -> List[LiquidityLevel]:
+    """
+    Evaluates price action against active liquidity levels to determine
+    if a sweep has occurred.
+
+    Args:
+        df: OHLC DataFrame indexed by timestamp (DatetimeIndex), same
+            convention as swings.py / structure.py / zones.py.
+        liquidity_levels: List of existing LiquidityLevel objects.
+
+    Returns:
+        Updated list of LiquidityLevel objects.
+
+    PERFORMANCE NOTE (fixed 2026-09):
+        The previous implementation used `for ts, row in sub_df.iterrows()`
+        to find the first bar that swept each level. Because this function
+        is called fresh every bar from run_backtest() on the full visible
+        history, and iterrows() creates a new pandas Series object per row,
+        this made the sweep-detection step alone scale roughly O(n^3) across
+        a full backtest and made real datasets (thousands of candles)
+        effectively never finish, despite passing on small unit-test
+        fixtures.
+
+        This version finds the exact same "first bar strictly after
+        formed_at where the sweep condition is true" using a vectorized
+        boolean mask + Series.idxmax(), which returns the index of the
+        first occurrence of the max value in a boolean Series (True > False,
+        so the first True wins) -- identical semantics to the old
+        break-on-first-match loop, computed in C rather than row-by-row
+        Python. The `mask.any()` guard is required because idxmax() on an
+        all-False (or empty) mask would otherwise silently return the first
+        index even though no sweep occurred.
+
+        No behavioral change: for every level, this returns the same
+        status, sweep_bar_index, and swept_at as the original loop would.
+    """
+    df_copy = df.copy()
+    df_copy.columns = [c.lower() for c in df_copy.columns]
+    df_copy = df_copy.sort_index()
+
+    # Map each timestamp to its positional bar index, matching the same
+    # pattern zones.py uses for index_pos -- sweep_bar_index must be an
+    # integer bar position, not a raw Timestamp.
+    index_pos = {ts: pos for pos, ts in enumerate(df_copy.index)}
+
+    for level in liquidity_levels:
+        if level.status != LiquidityStatus.ACTIVE:
+            continue
+
+        # Only bars strictly after the level was formed can sweep it --
+        # a level can't be swept by the same bar (or an earlier bar) that
+        # formed it.
+        sub_df = df_copy[df_copy.index > level.formed_at]
+
+        if sub_df.empty:
+            continue
+
+        if level.liquidity_type == LiquidityType.SELL_SIDE:
+            # SSL is swept if price drops below the swing low.
+            mask = sub_df["low"] < level.price
+        elif level.liquidity_type == LiquidityType.BUY_SIDE:
+            # BSL is swept if price exceeds the swing high.
+            mask = sub_df["high"] > level.price
+        else:
+            continue
+
+        if not mask.any():
+            continue
+
+        # First True in a boolean Series == first bar where the sweep
+        # condition holds, same bar the original loop would have broken on.
+        first_sweep_ts = mask.idxmax()
+
+        level.status = LiquidityStatus.SWEPT
+        level.sweep_bar_index = index_pos[first_sweep_ts]
+        level.swept_at = first_sweep_ts
+
+    return liquidity_levels
+
+================================================================
+FILE: .\strategy\zones.py
+================================================================
+"""
+strategy/zones.py
+
+Detects Supply and Demand zones from confirmed structural breaks
+(INITIAL_BREAK / BOS / CHOCH) produced by strategy/structure.py.
+
+Zone rules:
+    Origin:
+        The full cluster of consecutive candles opposite in color to
+        the impulsive move that produced the structural break â€”
+        walked backward from the break candle, past the entire
+        impulsive run, then collecting the whole opposite-colored
+        base immediately before it.
+
+    Boundaries:
+        price_top    = highest High in the origin cluster
+        price_bottom = lowest Low in the origin cluster
+
+    Mitigation:
+        A zone is mitigated the instant any later candle's wick
+        (High/Low) overlaps [price_bottom, price_top] â€” a touch,
+        not a close.
+
+Candle color:
+    bullish : close > open
+    bearish : close < open
+    neutral : close == open (doji)
+
+A neutral candle sitting where the base cluster should start means
+no clean opposite-colored base exists there. Rather than guess which
+side it belongs to, no zone is produced for that break. This is a
+conservative default and worth revisiting once real data shows how
+often it happens.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
+
+import pandas as pd
+
+from strategy.structure import StructureBreak, Trend
+
+
+class ZoneType(Enum):
+    DEMAND = "DEMAND"
+    SUPPLY = "SUPPLY"
+
+
+@dataclass
+class Zone:
+    zone_type: ZoneType
+    price_top: float
+    price_bottom: float
+    origin_start: pd.Timestamp
+    origin_end: pd.Timestamp
+    formed_from_break_at: pd.Timestamp
+    mitigated: bool = False
+    mitigated_at: Optional[pd.Timestamp] = None
+
+    def __repr__(self):
+        return (
+            f"Zone({self.zone_type.value}, "
+            f"top={self.price_top}, bottom={self.price_bottom}, "
+            f"origin={self.origin_start.strftime('%m-%d %H:%M')}"
+            f"->{self.origin_end.strftime('%m-%d %H:%M')}, "
+            f"mitigated={self.mitigated})"
+        )
+
+
+def _candle_color(row) -> str:
+    if row["close"] > row["open"]:
+        return "bullish"
+    if row["close"] < row["open"]:
+        return "bearish"
+    return "neutral"
+
+
+def _find_origin_cluster(df: pd.DataFrame, break_idx: int, impulse_color: str):
+    """
+    Walk backward from the break candle to find the origin cluster:
+    the full run of consecutive candles opposite to impulse_color
+    sitting immediately before the impulsive run that led to the break.
+
+    Returns (start_idx, end_idx) inclusive positions into df, or None
+    if no valid cluster is found (impulse consumes the start of the
+    data, or a neutral/same-color candle blocks the base).
+    """
+    base_color = "bearish" if impulse_color == "bullish" else "bullish"
+
+    i = break_idx
+
+    # Walk back through the impulsive run itself.
+    while i >= 0 and _candle_color(df.iloc[i]) == impulse_color:
+        i -= 1
+
+    if i < 0:
+        return None
+
+    if _candle_color(df.iloc[i]) != base_color:
+        # No clean opposite-colored candle directly before the impulse.
+        return None
+
+    cluster_end = i
+
+    # Walk back further collecting the full base cluster.
+    while i >= 0 and _candle_color(df.iloc[i]) == base_color:
+        i -= 1
+
+    cluster_start = i + 1
+
+    return cluster_start, cluster_end
+
+
+def compute_zone_for_break(
+    df: pd.DataFrame,
+    brk: StructureBreak,
+    break_idx: int,
+) -> Optional[Zone]:
+    """
+    Incremental equivalent of one loop iteration inside find_zones().
+
+    Computes the zone for exactly one structure break, given its
+    already-known positional index in df, instead of rebuilding an
+    index_pos lookup over the entire causal DataFrame on every call.
+
+    A zone's origin cluster and boundaries are fixed the moment its
+    break occurs (the walk in _find_origin_cluster is strictly
+    backward from break_idx and never looks forward), so this is
+    safe to call exactly once per new break and persist the result
+    for the rest of the adapter's lifetime.
+
+    find_zones() above remains completely untouched and is the
+    correctness reference. This function must remain byte-for-byte
+    equivalent to the per-break logic inside it -- see
+    phase_02_optimization/test_zone_equivalence.py, which must pass
+    before this function is used anywhere outside that test.
+    """
+    if df.empty:
+        return None
+
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+    df = df.sort_index()
+
+    impulse_color = "bullish" if brk.direction == Trend.BULLISH else "bearish"
+
+    cluster = _find_origin_cluster(df, break_idx, impulse_color)
+    if cluster is None:
+        return None
+
+    start_idx, end_idx = cluster
+    cluster_slice = df.iloc[start_idx:end_idx + 1]
+
+    zone_type = ZoneType.DEMAND if brk.direction == Trend.BULLISH else ZoneType.SUPPLY
+
+    return Zone(
+        zone_type=zone_type,
+        price_top=cluster_slice["high"].max(),
+        price_bottom=cluster_slice["low"].min(),
+        origin_start=df.index[start_idx],
+        origin_end=df.index[end_idx],
+        formed_from_break_at=brk.broken_at,
+    )
+
+
+def find_zones(df: pd.DataFrame, breaks: List[StructureBreak]) -> List[Zone]:
+    """
+    Build Supply/Demand zones from confirmed structural breaks.
+    Accepts the same raw OHLC DataFrame used for swings/structure,
+    any column case (Open/High/Low/Close or lowercase).
+    """
+    if df.empty or not breaks:
+        return []
+
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+    df = df.sort_index()
+
+    index_pos = {ts: pos for pos, ts in enumerate(df.index)}
+
+    zones: List[Zone] = []
+
+    for brk in breaks:
+        break_idx = index_pos.get(brk.broken_at)
+        if break_idx is None:
+            continue
+
+        impulse_color = "bullish" if brk.direction == Trend.BULLISH else "bearish"
+
+        cluster = _find_origin_cluster(df, break_idx, impulse_color)
+        if cluster is None:
+            continue
+
+        start_idx, end_idx = cluster
+        cluster_slice = df.iloc[start_idx:end_idx + 1]
+
+        zone_type = ZoneType.DEMAND if brk.direction == Trend.BULLISH else ZoneType.SUPPLY
+
+        zones.append(
+            Zone(
+                zone_type=zone_type,
+                price_top=cluster_slice["high"].max(),
+                price_bottom=cluster_slice["low"].min(),
+                origin_start=df.index[start_idx],
+                origin_end=df.index[end_idx],
+                formed_from_break_at=brk.broken_at,
+            )
+        )
+
+    return zones
+
+
+def update_mitigation(zones: List[Zone], candle: pd.Series, ts: pd.Timestamp) -> None:
+    """
+    Mark any zone mitigated the instant this candle's wick overlaps its
+    [price_bottom, price_top] range. Call once per candle, walking
+    forward chronologically â€” a zone can't be mitigated by candles at
+    or before the break that formed it.
+    """
+    for zone in zones:
+        if zone.mitigated:
+            continue
+        if ts <= zone.formed_from_break_at:
+            continue
+        if candle["low"] <= zone.price_top and candle["high"] >= zone.price_bottom:
+            zone.mitigated = True
+            zone.mitigated_at = ts
+
+================================================================
+FILE: .\strategy\signals.py
+================================================================
+"""
+strategy/signals.py
+
+Core signal generation engine for:
+    - Liquidity sweeps
+    - Structure breaks
+    - Flip zones
+    - Retest-triggered entries
+
+Design goals:
+    1. Preserve the existing strategy rules.
+    2. Support compatibility / one-shot execution.
+    3. Support optimized bar-by-bar backtesting.
+    4. Avoid repeated dataframe preparation.
+    5. Cache stable object -> bar-index resolutions.
+    6. Preserve zone-consumption state across replay bars.
+    7. Keep signal generation separate from forward retest simulation.
+    8. Support detector objects that are recreated during replay.
+
+RESEARCH METADATA (2026-09)
+---------------------------
+TradeSignal now carries `sweep_type` and `structure_break_type`. These
+are NOT new classification logic -- they are the literal values that
+this module already computes internally (via _resolve_level_type()
+and _resolve_trend_token()) to decide LONG vs SHORT and to match a
+structure break, but previously discarded once that decision was
+made. Attaching them lets the Phase 1 research layer (see
+strategy/backtest_report.py) study setup/mechanic behavior (BSL vs
+SSL sweeps, BOS vs CHOCH vs INITIAL_BREAK) without this module or the
+backtest engine changing behavior in any way.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import (
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Literal,
+    Hashable,
+)
+
+import pandas as pd
+
+from strategy.liquidity import LiquidityLevel, LiquidityStatus
+from strategy.structure import StructureBreak
+from strategy.zones import Zone
+
+
+# =====================================================================
+# ENUMS
+# =====================================================================
+
+class SignalType(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
+class SignalStatus(Enum):
+    PENDING_RETEST = "PENDING_RETEST"
+    TRIGGERED = "TRIGGERED"
+    INVALIDATED = "INVALIDATED"
+    EXPIRED = "EXPIRED"
+
+
+class EntryMode(Enum):
+    MIDPOINT = "MIDPOINT"
+    EXTREME = "EXTREME"
+
+
+# =====================================================================
+# CONSTANTS
+# =====================================================================
+
+_BULLISH_TOKENS = {
+    "bullish",
+    "long",
+    "buy",
+    "demand",
+    "bos_bullish",
+    "choch_bullish",
+}
+
+_BEARISH_TOKENS = {
+    "bearish",
+    "short",
+    "sell",
+    "supply",
+    "bos_bearish",
+    "choch_bearish",
+}
+
+
+# =====================================================================
+# TRADE SIGNAL
+# =====================================================================
+
+@dataclass
+class TradeSignal:
+    """
+    Immutable-style record of a generated trade setup.
+
+    The object starts as PENDING_RETEST and may later become
+    TRIGGERED or EXPIRED.
+
+    `entry_price` can change during retest execution if the candle
+    opening price provides a better fill.
+    """
+
+    signal_type: SignalType
+
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+
+    entry_time: Optional[pd.Timestamp] = None
+    exit_time: Optional[pd.Timestamp] = None
+
+    risk_reward_ratio: float = 0.0
+
+    status: SignalStatus = SignalStatus.PENDING_RETEST
+    entry_mode: EntryMode = EntryMode.MIDPOINT
+
+    zone_id: Optional[int] = None
+
+    # Stable identity of the matched zone (see _stable_cache_key),
+    # robust to zone objects being recreated across replay bars.
+    # Callers that need to re-locate the originating zone later
+    # (e.g. backtest.py re-matching a pending signal to its zone
+    # on a subsequent bar) should key on this, not on zone_id
+    # alone, since zone_id may be unset.
+    zone_stable_key: Optional[Hashable] = None
+
+    # Structure-break bar
+    bar_index: int = 0
+
+    # Liquidity-sweep bar
+    setup_bar_index: Optional[int] = None
+
+    # Liquidity-sweep timestamp
+    setup_timestamp: Optional[pd.Timestamp] = None
+
+    # Retest trigger metadata
+    triggered_at_bar: Optional[int] = None
+    triggered_at_time: Optional[pd.Timestamp] = None
+
+    # Number of bars from structure break to retest trigger.
+    bars_to_trigger: Optional[int] = None
+
+    # Trading session assigned by the caller / session engine.
+    session: str = "UNKNOWN"
+
+    # ------------------------------------------------------------
+    # RESEARCH METADATA (additive, non-functional)
+    # ------------------------------------------------------------
+    #
+    # sweep_type: the normalized liquidity-side token this setup was
+    # born from (e.g. "sell_side"/"ssl" -> LONG, "buy_side"/"bsl" ->
+    # SHORT). This is exactly the `level_type` value already computed
+    # by _resolve_level_type() in generate_flip_zone_signals() -- it
+    # is only being *retained* here, not recomputed differently.
+    sweep_type: Optional[str] = None
+
+    # structure_break_type: the normalized trend/type token of the
+    # confirming structure break (e.g. "bullish", "bos_bullish",
+    # "choch_bearish" -- whatever _resolve_trend_token() resolves for
+    # the real StructureBreak schema in strategy/structure.py). This
+    # is the same value _find_matching_structure_break() already
+    # computes internally to filter candidates; it is only being
+    # retained here, not recomputed differently.
+    structure_break_type: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.recalculate_risk_reward()
+
+    def recalculate_risk_reward(self) -> None:
+        """
+        Recalculate R:R from the current entry price.
+        """
+
+        risk = abs(
+            self.entry_price - self.stop_loss
+        )
+
+        reward = abs(
+            self.take_profit - self.entry_price
+        )
+
+        if risk > 0:
+            self.risk_reward_ratio = (
+                reward / risk
+            )
+        else:
+            self.risk_reward_ratio = 0.0
+
+
+# =====================================================================
+# NORMALIZATION HELPERS
+# =====================================================================
+
+def _normalize_enum_or_value(value) -> str:
+    """
+    Normalize Enum/string-like values to lowercase token form.
+    """
+
+    if isinstance(value, Enum):
+        value = value.value
+
+    return (
+        str(value)
+        .split(".")[-1]
+        .strip()
+        .lower()
+    )
+
+
+def _resolve_level_type(
+    liquidity: LiquidityLevel,
+) -> str:
+    """
+    Resolve liquidity type across supported LiquidityLevel schemas.
+    """
+
+    raw_val = (
+        getattr(liquidity, "type", None)
+        or getattr(liquidity, "liquidity_type", None)
+        or getattr(liquidity, "level_type", None)
+        or getattr(liquidity, "side", None)
+    )
+
+    if raw_val is None:
+        raise AttributeError(
+            f"LiquidityLevel {liquidity!r} has no "
+            "attribute type/side."
+        )
+
+    return _normalize_enum_or_value(
+        raw_val
+    )
+
+
+def _resolve_trend_token(obj) -> str:
+    """
+    Resolve directional metadata across supported schemas.
+    """
+
+    raw_val = (
+        getattr(obj, "trend", None)
+        or getattr(obj, "zone_type", None)
+        or getattr(obj, "structure_type", None)
+        or getattr(obj, "direction", None)
+        or getattr(obj, "type", None)
+    )
+
+    if raw_val is None:
+        return ""
+
+    return _normalize_enum_or_value(
+        raw_val
+    )
+
+
+# =====================================================================
+# CACHE KEY NORMALIZATION
+# =====================================================================
+
+def _make_hashable(value) -> Optional[Hashable]:
+    """
+    Convert common values into hashable representations.
+
+    This prevents cache-key construction from failing when a detector
+    stores an unusual but logically stable value.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (str, int, float, bool, bytes, tuple),
+    ):
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            pass
+
+    if isinstance(
+        value,
+        (pd.Timestamp, pd.Timedelta),
+    ):
+        return value
+
+    try:
+        return str(value)
+
+    except Exception:
+        return None
+
+
+def _stable_cache_key(obj) -> Optional[Hashable]:
+    """
+    Build a stable content-based cache key.
+
+    Detector objects may be recreated on every replay bar, so using
+    id(obj) is unreliable for persistent replay caching.
+
+    Priority:
+        1. Explicit persistent identifiers.
+        2. Combined historical identity fields.
+
+    The key includes the object type so a Zone and StructureBreak
+    sharing the same identifier do not collide.
+    """
+
+    if obj is None:
+        return None
+
+    object_type = type(obj).__name__
+
+    # -------------------------------------------------------------
+    # EXPLICIT STABLE IDENTIFIERS
+    # -------------------------------------------------------------
+
+    for attr in (
+        "zone_id",
+        "liquidity_id",
+        "structure_id",
+        "signal_id",
+        "id",
+    ):
+        value = getattr(
+            obj,
+            attr,
+            None,
+        )
+
+        if value is not None:
+            hashable_value = _make_hashable(
+                value
+            )
+
+            if hashable_value is not None:
+                return (
+                    object_type,
+                    "identity",
+                    attr,
+                    hashable_value,
+                )
+
+    # -------------------------------------------------------------
+    # COMPOSITE HISTORICAL IDENTITY
+    # -------------------------------------------------------------
+
+    identity_parts = []
+
+    for attr in (
+        "bar_index",
+        "formed_bar_index",
+        "break_bar_index",
+        "confirmed_bar_index",
+        "sweep_bar_index",
+        "confirmed_at",
+        "formed_at",
+        "timestamp",
+        "time",
+        "swing_at",
+        "broken_at",
+        "origin_end",
+        "swept_at",
+        "formed_from_break_at",
+    ):
+        value = getattr(
+            obj,
+            attr,
+            None,
+        )
+
+        if value is None:
+            continue
+
+        # Normalize timestamps so equivalent datetime objects
+        # (pd.Timestamp, np.datetime64, datetime, etc.) produce
+        # equivalent keys regardless of which concrete type the
+        # detector happened to store.
+        if (
+            "at" in attr
+            or attr in {
+                "timestamp",
+                "time",
+                "origin_end",
+            }
+        ):
+            try:
+                value = pd.Timestamp(value)
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        hashable_value = _make_hashable(
+            value
+        )
+
+        if hashable_value is not None:
+            identity_parts.append(
+                (
+                    attr,
+                    hashable_value,
+                )
+            )
+
+    if identity_parts:
+        return (
+            object_type,
+            "historical",
+            tuple(identity_parts),
+        )
+
+    return None
+
+
+# =====================================================================
+# DATAFRAME PREPARATION
+# =====================================================================
+
+def _prepare_working_dataframe(
+    df: pd.DataFrame,
+) -> Tuple[
+    pd.DataFrame,
+    str,
+    Dict[pd.Timestamp, int],
+]:
+    """
+    Prepare a dataframe for signal processing.
+
+    Compatibility / one-shot path:
+
+        - Copy dataframe
+        - Normalize column names
+        - Normalize timestamps
+        - Sort chronologically
+        - Build timestamp -> bar-index lookup
+    """
+
+    if df is None or df.empty:
+        raise ValueError(
+            "DataFrame cannot be None or empty."
+        )
+
+    working = df.copy()
+
+    working.columns = [
+        str(column).strip().lower()
+        for column in working.columns
+    ]
+
+    if "timestamp" in working.columns:
+        timestamp_column = "timestamp"
+
+    elif isinstance(
+        working.index,
+        pd.DatetimeIndex,
+    ):
+        working = working.reset_index()
+
+        working.columns = [
+            str(column).strip().lower()
+            for column in working.columns
+        ]
+
+        timestamp_column = (
+            "timestamp"
+            if "timestamp" in working.columns
+            else working.columns[0]
+        )
+
+    else:
+        raise ValueError(
+            "DataFrame must contain a 'timestamp' "
+            "column or DatetimeIndex."
+        )
+
+    required = {
+        "open",
+        "high",
+        "low",
+        "close",
+    }
+
+    missing = (
+        required
+        - set(working.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "DataFrame missing required columns: "
+            f"{sorted(missing)}"
+        )
+
+    working[timestamp_column] = pd.to_datetime(
+        working[timestamp_column],
+        errors="coerce",
+    )
+
+    if working[timestamp_column].isna().any():
+        raise ValueError(
+            "DataFrame contains invalid timestamps."
+        )
+
+    working = (
+        working
+        .sort_values(
+            timestamp_column,
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+
+    timestamp_lookup: Dict[
+        pd.Timestamp,
+        int,
+    ] = {}
+
+    for idx, timestamp in enumerate(
+        working[timestamp_column]
+    ):
+        if timestamp not in timestamp_lookup:
+            timestamp_lookup[timestamp] = idx
+
+    return (
+        working,
+        timestamp_column,
+        timestamp_lookup,
+    )
+
+
+# =====================================================================
+# FULL BACKTEST CONTEXT
+# =====================================================================
+
+def _prepare_full_context(
+    df: pd.DataFrame,
+) -> dict:
+    """
+    Prepare the complete historical dataframe once.
+
+    Expensive operations are performed only once.
+
+    Persistent state:
+        - bar_index_cache
+        - consumed_zones
+    """
+
+    (
+        working,
+        timestamp_column,
+        timestamp_lookup,
+    ) = _prepare_working_dataframe(df)
+
+    return {
+        "working": working,
+
+        "timestamp_column":
+            timestamp_column,
+
+        "timestamp_lookup":
+            timestamp_lookup,
+
+        "highs":
+            working["high"].to_numpy(),
+
+        "lows":
+            working["low"].to_numpy(),
+
+        "opens":
+            working["open"].to_numpy(),
+
+        "timestamps":
+            working[
+                timestamp_column
+            ].to_numpy(),
+
+        # Persistent stable-object -> bar-index cache.
+        "bar_index_cache": {},
+
+        # Persistent logical-zone consumption state.
+        "consumed_zones": set(),
+    }
+
+
+def _slice_prepared_context(
+    precomputed_context: dict,
+    upto_index: int,
+) -> dict:
+    """
+    Return a cheap visible-history view.
+
+    No dataframe copy, sorting, timestamp lookup rebuilding, or
+    NumPy extraction occurs here.
+
+    Persistent state is passed by reference.
+    """
+
+    if precomputed_context is None:
+        raise ValueError(
+            "precomputed_context cannot be None."
+        )
+
+    full_working = (
+        precomputed_context["working"]
+    )
+
+    if len(full_working) == 0:
+        raise ValueError(
+            "Prepared dataframe cannot be empty."
+        )
+
+    if upto_index < 0:
+        upto_index = 0
+
+    if upto_index >= len(full_working):
+        upto_index = (
+            len(full_working) - 1
+        )
+
+    return {
+        "working":
+            full_working.iloc[
+                :upto_index + 1
+            ],
+
+        "timestamp_column":
+            precomputed_context[
+                "timestamp_column"
+            ],
+
+        "timestamp_lookup":
+            precomputed_context[
+                "timestamp_lookup"
+            ],
+
+        "highs":
+            precomputed_context["highs"],
+
+        "lows":
+            precomputed_context["lows"],
+
+        "opens":
+            precomputed_context["opens"],
+
+        "timestamps":
+            precomputed_context[
+                "timestamps"
+            ],
+
+        "bar_index_cache":
+            precomputed_context.get(
+                "bar_index_cache"
+            ),
+
+        "consumed_zones":
+            precomputed_context.get(
+                "consumed_zones"
+            ),
+    }
+
+
+# =====================================================================
+# TIMESTAMP -> BAR INDEX
+# =====================================================================
+
+def _resolve_timestamp_to_bar_index(
+    value,
+    working: pd.DataFrame,
+    timestamp_column: str,
+    timestamp_lookup: Optional[
+        Dict[pd.Timestamp, int]
+    ] = None,
+) -> Optional[int]:
+    """
+    Resolve a timestamp to its chronological bar index.
+
+    Resolution order:
+        1. Pre-built dictionary.
+        2. DatetimeIndex lookup.
+        3. Timestamp-column equality fallback.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        timestamp = pd.Timestamp(value)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    # Fast path.
+    if timestamp_lookup is not None:
+        return timestamp_lookup.get(
+            timestamp
+        )
+
+    # DatetimeIndex fallback.
+    if isinstance(
+        working.index,
+        pd.DatetimeIndex,
+    ):
+        try:
+            location = (
+                working.index.get_loc(
+                    timestamp
+                )
+            )
+
+            if isinstance(
+                location,
+                int,
+            ):
+                return location
+
+            if isinstance(
+                location,
+                slice,
+            ):
+                return location.start
+
+            if hasattr(
+                location,
+                "nonzero",
+            ):
+                positions = (
+                    location.nonzero()[0]
+                )
+
+                if len(positions) > 0:
+                    return int(
+                        positions[0]
+                    )
+
+        except KeyError:
+            pass
+
+    # Timestamp-column fallback.
+    if timestamp_column in working.columns:
+
+        matches = working.index[
+            working[timestamp_column]
+            == timestamp
+        ]
+
+        if len(matches) > 0:
+            return int(matches[0])
+
+    return None
+
+
+# =====================================================================
+# BAR INDEX RESOLUTION
+# =====================================================================
+
+def _resolve_bar_index(
+    obj,
+    working: pd.DataFrame,
+    timestamp_column: str,
+    timestamp_lookup: Optional[
+        Dict[pd.Timestamp, int]
+    ] = None,
+    bar_index_cache: Optional[dict] = None,
+) -> Optional[int]:
+    """
+    Resolve a strategy object to its chronological bar index.
+
+    Cached by stable logical identity rather than Python object identity.
+
+    This is important because replay detectors may recreate equivalent
+    objects on every bar.
+    """
+
+    if obj is None:
+        return None
+
+    # ================================================================
+    # FAST CACHE PATH
+    # ================================================================
+
+    cache_key = None
+
+    if bar_index_cache is not None:
+
+        cache_key = _stable_cache_key(
+            obj
+        )
+
+        if cache_key is not None:
+
+            cached = bar_index_cache.get(
+                cache_key
+            )
+
+            if cached is not None:
+                return cached
+
+    # ================================================================
+    # DIRECT BAR-INDEX ATTRIBUTES
+    # ================================================================
+
+    for attr in (
+        "bar_index",
+        "formed_bar_index",
+        "break_bar_index",
+        "confirmed_bar_index",
+        "sweep_bar_index",
+    ):
+
+        value = getattr(
+            obj,
+            attr,
+            None,
+        )
+
+        if value is None:
+            continue
+
+        try:
+            index = int(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if 0 <= index < len(working):
+
+            if (
+                bar_index_cache is not None
+                and cache_key is not None
+            ):
+                bar_index_cache[
+                    cache_key
+                ] = index
+
+            return index
+
+    # ================================================================
+    # TIMESTAMP ATTRIBUTES
+    # ================================================================
+
+    for attr in (
+        "confirmed_at",
+        "formed_at",
+        "timestamp",
+        "time",
+        "swing_at",
+        "broken_at",
+        "origin_end",
+        "swept_at",
+        "formed_from_break_at",
+    ):
+
+        value = getattr(
+            obj,
+            attr,
+            None,
+        )
+
+        if value is None:
+            continue
+
+        index = (
+            _resolve_timestamp_to_bar_index(
+                value=value,
+                working=working,
+                timestamp_column=timestamp_column,
+                timestamp_lookup=timestamp_lookup,
+            )
+        )
+
+        if index is not None:
+
+            if (
+                bar_index_cache is not None
+                and cache_key is not None
+            ):
+                bar_index_cache[
+                    cache_key
+                ] = index
+
+            return index
+
+    return None
+
+
+# =====================================================================
+# STRUCTURE BREAK MATCHING
+# =====================================================================
+
+def _find_matching_structure_break(
+    sweep_idx: int,
+    level_type: str,
+    structure_breaks: List[StructureBreak],
+    working: pd.DataFrame,
+    timestamp_column: str,
+    max_bars_after_sweep: int,
+    timestamp_lookup: Optional[
+        Dict[pd.Timestamp, int]
+    ] = None,
+    bar_index_cache: Optional[dict] = None,
+) -> Optional[StructureBreak]:
+    """
+    Find the earliest valid structure break after a liquidity sweep.
+    """
+
+    matching_breaks = []
+
+    for structure_break in structure_breaks:
+
+        break_idx = _resolve_bar_index(
+            structure_break,
+            working,
+            timestamp_column,
+            timestamp_lookup,
+            bar_index_cache,
+        )
+
+        if break_idx is None:
+            continue
+
+        # Break must occur strictly after sweep.
+        if not (
+            sweep_idx
+            < break_idx
+            <= (
+                sweep_idx
+                + max_bars_after_sweep
+            )
+        ):
+            continue
+
+        trend_normalized = (
+            _resolve_trend_token(
+                structure_break
+            )
+        )
+
+        # SSL / sell-side sweep -> bullish confirmation.
+        if (
+            level_type
+            in (
+                "sell_side",
+                "ssl",
+                "low",
+            )
+            and trend_normalized
+            in _BULLISH_TOKENS
+        ):
+            matching_breaks.append(
+                (
+                    break_idx,
+                    structure_break,
+                )
+            )
+
+        # BSL / buy-side sweep -> bearish confirmation.
+        elif (
+            level_type
+            in (
+                "buy_side",
+                "bsl",
+                "high",
+            )
+            and trend_normalized
+            in _BEARISH_TOKENS
+        ):
+            matching_breaks.append(
+                (
+                    break_idx,
+                    structure_break,
+                )
+            )
+
+    if not matching_breaks:
+        return None
+
+    # Earliest valid break wins.
+    matching_breaks.sort(
+        key=lambda item: item[0]
+    )
+
+    return matching_breaks[0][1]
+
+
+# =====================================================================
+# FLIP ZONE MATCHING
+# =====================================================================
+
+def _zone_consumption_keys(
+    zone: Zone,
+) -> Set[Hashable]:
+    """
+    Build the persistent keys used to identify a logical zone.
+
+    Explicit zone_id is preferred. The stable cache key is included
+    as a fallback / secondary identity.
+    """
+
+    keys: Set[Hashable] = set()
+
+    zone_id = getattr(
+        zone,
+        "zone_id",
+        None,
+    )
+
+    if zone_id is not None:
+        keys.add(zone_id)
+
+    stable_key = _stable_cache_key(
+        zone
+    )
+
+    if stable_key is not None:
+        keys.add(stable_key)
+
+    return keys
+
+
+def _is_zone_consumed(
+    zone: Zone,
+    consumed_zones: Set[Hashable],
+) -> bool:
+    """
+    Determine whether the logical zone has already been consumed.
+    """
+
+    for key in _zone_consumption_keys(
+        zone
+    ):
+        if key in consumed_zones:
+            return True
+
+    return False
+
+
+def _consume_zone(
+    zone: Zone,
+    consumed_zones: Set[Hashable],
+) -> None:
+    """
+    Persistently mark a logical zone as consumed.
+    """
+
+    for key in _zone_consumption_keys(
+        zone
+    ):
+        consumed_zones.add(key)
+
+
+def _find_matching_flip_zone(
+    signal_type: SignalType,
+    structure_break: StructureBreak,
+    zones: List[Zone],
+    working: pd.DataFrame,
+    timestamp_column: str,
+    max_bars_from_break: int,
+    consumed_zones: Set[Hashable],
+    timestamp_lookup: Optional[
+        Dict[pd.Timestamp, int]
+    ] = None,
+    bar_index_cache: Optional[dict] = None,
+) -> Optional[Zone]:
+    """
+    Find the most recent qualifying unconsumed flip zone.
+
+    Rejection conditions:
+        - Already consumed
+        - Mitigated
+        - Wrong direction
+        - Formed after structure break
+        - Too far from structure break
+    """
+
+    break_idx = _resolve_bar_index(
+        structure_break,
+        working,
+        timestamp_column,
+        timestamp_lookup,
+        bar_index_cache,
+    )
+
+    if break_idx is None:
+        return None
+
+    candidates = []
+
+    for zone in zones:
+
+        # -------------------------------------------------------------
+        # CONSUMPTION
+        # -------------------------------------------------------------
+
+        if _is_zone_consumed(
+            zone,
+            consumed_zones,
+        ):
+            continue
+
+        # -------------------------------------------------------------
+        # MITIGATION
+        # -------------------------------------------------------------
+
+        is_mitigated = (
+            getattr(
+                zone,
+                "is_mitigated",
+                False,
+            )
+            or getattr(
+                zone,
+                "mitigated",
+                False,
+            )
+        )
+
+        if is_mitigated:
+            continue
+
+        # -------------------------------------------------------------
+        # DIRECTION
+        # -------------------------------------------------------------
+
+        zone_trend = (
+            _resolve_trend_token(zone)
+        )
+
+        if (
+            signal_type == SignalType.LONG
+            and zone_trend
+            not in _BULLISH_TOKENS
+        ):
+            continue
+
+        if (
+            signal_type == SignalType.SHORT
+            and zone_trend
+            not in _BEARISH_TOKENS
+        ):
+            continue
+
+        # -------------------------------------------------------------
+        # FORMATION INDEX
+        # -------------------------------------------------------------
+
+        zone_idx = _resolve_bar_index(
+            zone,
+            working,
+            timestamp_column,
+            timestamp_lookup,
+            bar_index_cache,
+        )
+
+        if zone_idx is None:
+            continue
+
+        # Zone must exist no later than break.
+        if zone_idx > break_idx:
+            continue
+
+        # Zone must be within configured distance.
+        if (
+            break_idx
+            - zone_idx
+            > max_bars_from_break
+        ):
+            continue
+
+        candidates.append(
+            (
+                zone_idx,
+                zone,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    # Most recently formed qualifying zone wins.
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return candidates[0][1]
+
+
+# =====================================================================
+# SIGNAL GENERATION
+# =====================================================================
+
+def generate_flip_zone_signals(
+    liquidity_levels: List[LiquidityLevel],
+    structure_breaks: List[StructureBreak],
+    zones: List[Zone],
+    df: Optional[pd.DataFrame] = None,
+
+    max_bars_after_sweep: int = 15,
+    max_bars_from_break: int = 5,
+    max_bars_to_retest: int = 50,
+
+    reward_multiple: float = 2.5,
+    stop_buffer: float = 0.0,
+
+    entry_mode: Literal[
+        "midpoint",
+        "extreme",
+    ] = "midpoint",
+
+    precomputed_context: Optional[dict] = None,
+    upto_index: Optional[int] = None,
+
+    run_retest_simulation: bool = True,
+
+    consumed_zones: Optional[
+        Set[Hashable]
+    ] = None,
+
+    session: str = "UNKNOWN",
+) -> List[TradeSignal]:
+    """
+    Generate Flip Zone trade signals.
+
+    COMPATIBILITY / ONE-SHOT PATH
+    ------------------------------
+    Uses df directly and prepares the dataframe once.
+
+    OPTIMIZED BAR-BY-BAR PATH
+    --------------------------
+    Uses precomputed_context + upto_index.
+
+    RETEST MODES
+    ------------
+    run_retest_simulation=True
+        This function may scan forward through candles visible
+        in the supplied working dataframe.
+
+    run_retest_simulation=False
+        This function returns fresh PENDING_RETEST signals.
+        The caller, normally backtest.py, owns the future-bar
+        retest state machine.
+
+    ZONE STATE
+    ----------
+    consumed_zones may be supplied externally so that logical
+    zones remain consumed across replay bars even when detector
+    objects are recreated.
+    """
+
+    # =================================================================
+    # PARAMETER VALIDATION
+    # =================================================================
+
+    if max_bars_after_sweep <= 0:
+        raise ValueError(
+            "max_bars_after_sweep must be > 0"
+        )
+
+    if max_bars_from_break < 0:
+        raise ValueError(
+            "max_bars_from_break cannot be negative"
+        )
+
+    if max_bars_to_retest <= 0:
+        raise ValueError(
+            "max_bars_to_retest must be > 0"
+        )
+
+    if reward_multiple <= 0:
+        raise ValueError(
+            "reward_multiple must be > 0"
+        )
+
+    if stop_buffer < 0:
+        raise ValueError(
+            "stop_buffer cannot be negative"
+        )
+
+    if entry_mode not in (
+        "midpoint",
+        "extreme",
+    ):
+        raise ValueError(
+            "entry_mode must be "
+            "'midpoint' or 'extreme'."
+        )
+
+    # Extreme mode requires a non-zero stop distance.
+    if (
+        entry_mode == "extreme"
+        and stop_buffer <= 0
+    ):
+        stop_buffer = 0.01
+
+    # =================================================================
+    # EMPTY INPUT GUARD
+    # =================================================================
+
+    if (
+        not liquidity_levels
+        or not structure_breaks
+        or not zones
+    ):
+        return []
+
+    # =================================================================
+    # PREPARE DATA
+    # =================================================================
+
+    if precomputed_context is not None:
+
+        if upto_index is None:
+
+            if df is None or df.empty:
+                return []
+
+            upto_index = len(df) - 1
+
+        sliced = _slice_prepared_context(
+            precomputed_context,
+            upto_index,
+        )
+
+        working = sliced["working"]
+
+        timestamp_column = (
+            sliced["timestamp_column"]
+        )
+
+        timestamp_lookup = (
+            sliced["timestamp_lookup"]
+        )
+
+        highs = sliced["highs"]
+        lows = sliced["lows"]
+        opens = sliced["opens"]
+        timestamps = sliced["timestamps"]
+
+        bar_index_cache = (
+            sliced["bar_index_cache"]
+        )
+
+        if consumed_zones is None:
+            consumed_zones = (
+                sliced["consumed_zones"]
+            )
+
+    else:
+
+        if df is None or df.empty:
+            return []
+
+        (
+            working,
+            timestamp_column,
+            timestamp_lookup,
+        ) = _prepare_working_dataframe(
+            df
+        )
+
+        highs = (
+            working["high"].to_numpy()
+        )
+
+        lows = (
+            working["low"].to_numpy()
+        )
+
+        opens = (
+            working["open"].to_numpy()
+        )
+
+        timestamps = (
+            working[
+                timestamp_column
+            ].to_numpy()
+        )
+
+        # One-shot compatibility cache.
+        bar_index_cache = {}
+
+    # Compatibility fallback.
+    if consumed_zones is None:
+        consumed_zones = set()
+
+    signals: List[TradeSignal] = []
+
+    # =================================================================
+    # COLLECT SWEPT LIQUIDITY
+    # =================================================================
+
+    swept_liquidity = []
+
+    for level in liquidity_levels:
+
+        status = getattr(
+            level,
+            "status",
+            None,
+        )
+
+        status_val = str(
+            status
+        ).upper()
+
+        is_swept = (
+            status_val == "SWEPT"
+            or status == LiquidityStatus.SWEPT
+        )
+
+        if not is_swept:
+            continue
+
+        sweep_idx = getattr(
+            level,
+            "sweep_bar_index",
+            None,
+        )
+
+        if sweep_idx is None:
+
+            sweep_idx = (
+                _resolve_bar_index(
+                    level,
+                    working,
+                    timestamp_column,
+                    timestamp_lookup,
+                    bar_index_cache,
+                )
+            )
+
+        if sweep_idx is not None:
+            swept_liquidity.append(
+                (
+                    int(sweep_idx),
+                    level,
+                )
+            )
+
+    if not swept_liquidity:
+        return []
+
+    swept_liquidity.sort(
+        key=lambda item: item[0]
+    )
+
+    # =================================================================
+    # PROCESS EACH LIQUIDITY SWEEP
+    # =================================================================
+
+    for (
+        sweep_idx,
+        liquidity,
+    ) in swept_liquidity:
+
+        if not (
+            0 <= sweep_idx < len(working)
+        ):
+            continue
+
+        # -------------------------------------------------------------
+        # SIGNAL DIRECTION
+        # -------------------------------------------------------------
+
+        level_type = (
+            _resolve_level_type(
+                liquidity
+            )
+        )
+
+        if level_type in (
+            "sell_side",
+            "ssl",
+            "low",
+        ):
+            signal_type = SignalType.LONG
+
+        elif level_type in (
+            "buy_side",
+            "bsl",
+            "high",
+        ):
+            signal_type = SignalType.SHORT
+
+        else:
+            continue
+
+        # -------------------------------------------------------------
+        # STRUCTURE BREAK
+        # -------------------------------------------------------------
+
+        matching_break = (
+            _find_matching_structure_break(
+                sweep_idx=sweep_idx,
+                level_type=level_type,
+                structure_breaks=structure_breaks,
+                working=working,
+                timestamp_column=timestamp_column,
+                max_bars_after_sweep=(
+                    max_bars_after_sweep
+                ),
+                timestamp_lookup=timestamp_lookup,
+                bar_index_cache=bar_index_cache,
+            )
+        )
+
+        if matching_break is None:
+            continue
+
+        # -------------------------------------------------------------
+        # RESEARCH METADATA -- reuses the SAME classification logic
+        # that was already used above to accept this sweep/break pair.
+        # No new detection rule is introduced here.
+        # -------------------------------------------------------------
+
+        resolved_structure_break_type = (
+            _resolve_trend_token(
+                matching_break
+            )
+        )
+
+        # -------------------------------------------------------------
+        # FLIP ZONE
+        # -------------------------------------------------------------
+
+        matching_zone = (
+            _find_matching_flip_zone(
+                signal_type=signal_type,
+                structure_break=matching_break,
+                zones=zones,
+                working=working,
+                timestamp_column=timestamp_column,
+                max_bars_from_break=(
+                    max_bars_from_break
+                ),
+                consumed_zones=consumed_zones,
+                timestamp_lookup=timestamp_lookup,
+                bar_index_cache=bar_index_cache,
+            )
+        )
+
+        if matching_zone is None:
+            continue
+
+        # -------------------------------------------------------------
+        # ZONE IDENTIFICATION
+        # -------------------------------------------------------------
+
+        zone_id_attr = getattr(
+            matching_zone,
+            "zone_id",
+            None,
+        )
+
+        resolved_zone_id = zone_id_attr
+
+        # Stable identity of this zone, robust to the zone object
+        # being recreated on a later replay bar (see backtest.py's
+        # _visible_zones, which returns a fresh copy every call).
+        resolved_zone_stable_key = _stable_cache_key(
+            matching_zone
+        )
+
+        # -------------------------------------------------------------
+        # ZONE BOUNDARIES
+        # -------------------------------------------------------------
+
+        try:
+
+            price_top = float(
+                matching_zone.price_top
+            )
+
+            price_bottom = float(
+                matching_zone.price_bottom
+            )
+
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if price_top <= price_bottom:
+            continue
+
+        # -------------------------------------------------------------
+        # TRADE LEVELS
+        # -------------------------------------------------------------
+
+        if signal_type == SignalType.LONG:
+
+            stop_loss = (
+                price_bottom
+                - stop_buffer
+            )
+
+            if entry_mode == "extreme":
+                entry_price = price_bottom
+
+            else:
+                entry_price = (
+                    price_top
+                    + price_bottom
+                ) / 2.0
+
+            risk = (
+                entry_price
+                - stop_loss
+            )
+
+            if risk <= 0:
+                continue
+
+            take_profit = (
+                entry_price
+                + risk * reward_multiple
+            )
+
+        else:
+
+            stop_loss = (
+                price_top
+                + stop_buffer
+            )
+
+            if entry_mode == "extreme":
+                entry_price = price_top
+
+            else:
+                entry_price = (
+                    price_top
+                    + price_bottom
+                ) / 2.0
+
+            risk = (
+                stop_loss
+                - entry_price
+            )
+
+            if risk <= 0:
+                continue
+
+            take_profit = (
+                entry_price
+                - risk * reward_multiple
+            )
+
+        # -------------------------------------------------------------
+        # STRUCTURE BREAK INDEX
+        # -------------------------------------------------------------
+
+        break_idx = _resolve_bar_index(
+            matching_break,
+            working,
+            timestamp_column,
+            timestamp_lookup,
+            bar_index_cache,
+        )
+
+        if break_idx is None:
+            continue
+
+        signal_timestamp = pd.Timestamp(
+            timestamps[break_idx]
+        )
+
+        setup_timestamp = pd.Timestamp(
+            timestamps[sweep_idx]
+        )
+
+        # -------------------------------------------------------------
+        # CREATE SIGNAL
+        # -------------------------------------------------------------
+
+        trade_signal = TradeSignal(
+            signal_type=signal_type,
+
+            entry_price=float(
+                entry_price
+            ),
+
+            stop_loss=float(
+                stop_loss
+            ),
+
+            take_profit=float(
+                take_profit
+            ),
+
+            entry_time=signal_timestamp,
+
+            status=(
+                SignalStatus.PENDING_RETEST
+            ),
+
+            entry_mode=(
+                EntryMode.MIDPOINT
+                if entry_mode == "midpoint"
+                else EntryMode.EXTREME
+            ),
+
+            zone_id=resolved_zone_id,
+
+            zone_stable_key=resolved_zone_stable_key,
+
+            bar_index=int(
+                break_idx
+            ),
+
+            setup_bar_index=int(
+                sweep_idx
+            ),
+
+            setup_timestamp=setup_timestamp,
+
+            session=str(
+                session
+            ),
+
+            sweep_type=level_type,
+
+            structure_break_type=(
+                resolved_structure_break_type
+                or None
+            ),
+        )
+
+        # =================================================================
+        # OPTIONAL FORWARD RETEST
+        # =================================================================
+
+        if run_retest_simulation:
+
+            retested = False
+
+            end_idx = min(
+                break_idx
+                + max_bars_to_retest
+                + 1,
+                len(working),
+            )
+
+            for idx in range(
+                break_idx + 1,
+                end_idx,
+            ):
+
+                bar_high = float(
+                    highs[idx]
+                )
+
+                bar_low = float(
+                    lows[idx]
+                )
+
+                bar_open = float(
+                    opens[idx]
+                )
+
+                bar_time = pd.Timestamp(
+                    timestamps[idx]
+                )
+
+                # ---------------------------------------------------------
+                # LONG RETEST
+                # ---------------------------------------------------------
+
+                if (
+                    signal_type
+                    == SignalType.LONG
+                ):
+
+                    if bar_low <= price_top:
+
+                        trade_signal.status = (
+                            SignalStatus.TRIGGERED
+                        )
+
+                        trade_signal.triggered_at_bar = (
+                            int(idx)
+                        )
+
+                        trade_signal.triggered_at_time = (
+                            bar_time
+                        )
+
+                        trade_signal.bars_to_trigger = (
+                            int(idx - break_idx)
+                        )
+
+                        # Better long fill at candle open.
+                        if (
+                            bar_open
+                            < trade_signal.entry_price
+                        ):
+                            trade_signal.entry_price = (
+                                bar_open
+                            )
+
+                        trade_signal.entry_time = (
+                            bar_time
+                        )
+
+                        # Entry changed -> update R:R.
+                        trade_signal.recalculate_risk_reward()
+
+                        retested = True
+                        break
+
+                # ---------------------------------------------------------
+                # SHORT RETEST
+                # ---------------------------------------------------------
+
+                else:
+
+                    if bar_high >= price_bottom:
+
+                        trade_signal.status = (
+                            SignalStatus.TRIGGERED
+                        )
+
+                        trade_signal.triggered_at_bar = (
+                            int(idx)
+                        )
+
+                        trade_signal.triggered_at_time = (
+                            bar_time
+                        )
+
+                        trade_signal.bars_to_trigger = (
+                            int(idx - break_idx)
+                        )
+
+                        # Better short fill at candle open.
+                        if (
+                            bar_open
+                            > trade_signal.entry_price
+                        ):
+                            trade_signal.entry_price = (
+                                bar_open
+                            )
+
+                        trade_signal.entry_time = (
+                            bar_time
+                        )
+
+                        # Entry changed -> update R:R.
+                        trade_signal.recalculate_risk_reward()
+
+                        retested = True
+                        break
+
+            # -------------------------------------------------------------
+            # RETEST EXPIRED
+            # -------------------------------------------------------------
+
+            if not retested:
+
+                trade_signal.status = (
+                    SignalStatus.EXPIRED
+                )
+
+        # =================================================================
+        # CONSUME ZONE AFTER VALID SIGNAL CONSTRUCTION
+        # =================================================================
+        #
+        # IMPORTANT:
+        #
+        # Consumption happens only after:
+        #     - zone boundaries are valid
+        #     - risk is valid
+        #     - break index is valid
+        #     - TradeSignal has been successfully created
+        #
+        # The logical identity is persisted through _stable_cache_key()
+        # and/or the explicit zone_id, so recreated detector objects
+        # cannot bypass consumption.
+        # =================================================================
+
+        _consume_zone(
+            matching_zone,
+            consumed_zones,
+        )
+
+        # -------------------------------------------------------------
+        # STORE SIGNAL
+        # -------------------------------------------------------------
+
+        signals.append(
+            trade_signal
+        )
+
+    # =================================================================
+    # CHRONOLOGICAL OUTPUT
+    # =================================================================
+
+    signals.sort(
+        key=lambda signal: signal.bar_index
+    )
+
+    return signals
+
+================================================================
+FILE: .\strategy\retest_engine.py
+================================================================
+"""
+strategy/retest_engine.py
+
+Shared PENDING_RETEST -> {STILL_PENDING, EXPIRED, INVALIDATED, TRIGGERED}
+state machine.
+
+WHY THIS FILE EXISTS
+---------------------
+This logic used to live inline inside strategy/backtest.py's
+run_backtest() replay loop (the "C. MANAGE PENDING SIGNALS" section).
+
+Phase 3's roadmap requires a Strategy Adapter that feeds the
+PaperTradeEngine only already-TRIGGERED signals, and explicitly
+forbids the adapter from containing its own copy of "when does a
+signal trigger" logic (that would be a second signal engine).
+
+Since generate_flip_zone_signals() only ever emits PENDING_RETEST
+signals (when run_retest_simulation=False), something has to run
+this exact state machine bar-by-bar in both:
+
+    - strategy/backtest.py   (replay over an already-known dataframe)
+    - Phase 3 Strategy Adapter (live/incremental, one candle at a time)
+
+Extracting it here means both callers share one implementation, and
+neither duplicates it.
+
+BEHAVIOR GUARANTEE
+-------------------
+Every line of decision logic below is copied unchanged from the
+original inline block in strategy/backtest.py. Nothing about
+thresholds, ordering, or the EPSILON tolerance has been altered.
+Only the surrounding bookkeeping (which list a signal lands in,
+which counter increments) has moved to the caller, via the returned
+PendingOutcome.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
+
+import pandas as pd
+
+from strategy.signals import (
+    SignalType,
+    SignalStatus,
+    TradeSignal,
+    _stable_cache_key,
+)
+from strategy.zones import Zone
+
+
+EPSILON = 1e-8
+
+
+# ============================================================
+# OUTCOME TYPES
+# ============================================================
+
+class PendingOutcomeType(Enum):
+    STILL_PENDING = "STILL_PENDING"
+    EXPIRED = "EXPIRED"
+    INVALIDATED = "INVALIDATED"
+    TRIGGERED = "TRIGGERED"
+
+
+@dataclass
+class PendingOutcome:
+    """
+    Result of advancing one pending signal by exactly one bar.
+
+    For TRIGGERED outcomes:
+        planned_entry  -- the signal's entry price BEFORE the actual
+                           fill was applied (mirrors backtest.py's
+                           local `planned_entry` variable, used as
+                           TradeResult.entry_price).
+        fill_price     -- the actual OHLC-compatible fill.
+        initial_risk   -- abs(fill_price - stop_loss).
+
+    For all other outcomes these fields are None.
+    """
+
+    outcome: PendingOutcomeType
+    planned_entry: Optional[float] = None
+    fill_price: Optional[float] = None
+    initial_risk: Optional[float] = None
+
+
+# ============================================================
+# EXECUTION HELPERS (copied unchanged from backtest.py)
+# ============================================================
+
+def _gap_aware_fill(
+    signal_type: SignalType,
+    desired_entry: float,
+    bar_open: float,
+) -> float:
+    """
+    Calculate an OHLC-compatible fill.
+
+    LONG:
+        Gap/open below desired entry -> fill at open.
+        Otherwise -> fill at desired entry.
+
+    SHORT:
+        Gap/open above desired entry -> fill at open.
+        Otherwise -> fill at desired entry.
+    """
+
+    if signal_type == SignalType.LONG:
+        if bar_open <= desired_entry:
+            return float(bar_open)
+        return float(desired_entry)
+
+    if signal_type == SignalType.SHORT:
+        if bar_open >= desired_entry:
+            return float(bar_open)
+        return float(desired_entry)
+
+    raise ValueError(f"Unsupported signal type: {signal_type}")
+
+
+def _long_retest_touched(
+    bar_low: float,
+    zone_top: float,
+) -> bool:
+    """LONG retest condition: price reaches the zone's top boundary."""
+    return bar_low <= (zone_top + EPSILON)
+
+
+def _short_retest_touched(
+    bar_high: float,
+    zone_bottom: float,
+) -> bool:
+    """SHORT retest condition: price reaches the zone's bottom boundary."""
+    return bar_high >= (zone_bottom - EPSILON)
+
+
+# ============================================================
+# MAIN STATE-MACHINE STEP
+# ============================================================
+
+def advance_pending_signal(
+    signal: TradeSignal,
+    setup_idx: int,
+    current_index: int,
+    current_time: pd.Timestamp,
+    current_open: float,
+    current_high: float,
+    current_low: float,
+    visible_zones: List[Zone],
+    max_bars_to_retest: int,
+) -> PendingOutcome:
+    """
+    Advance one PENDING_RETEST signal by exactly one bar.
+
+    Mutates `signal.status` (and, on TRIGGERED, `signal.entry_price` /
+    `signal.risk_reward_ratio` via recalculate_risk_reward()) exactly
+    as the original inline backtest.py loop did. The caller is
+    responsible for counters and list membership based on the
+    returned PendingOutcome.outcome.
+    """
+
+    bars_elapsed = current_index - setup_idx
+
+    # ------------------------------------------------
+    # EXPIRATION
+    # ------------------------------------------------
+
+    if bars_elapsed > max_bars_to_retest:
+        signal.status = SignalStatus.EXPIRED
+        return PendingOutcome(PendingOutcomeType.EXPIRED)
+
+    # ------------------------------------------------
+    # INVALIDATION
+    #
+    # Stop is checked before entry trigger.
+    # ------------------------------------------------
+
+    if signal.signal_type == SignalType.LONG:
+        invalidated = current_low <= signal.stop_loss + EPSILON
+
+    elif signal.signal_type == SignalType.SHORT:
+        invalidated = current_high >= signal.stop_loss - EPSILON
+
+    else:
+        signal.status = SignalStatus.INVALIDATED
+        return PendingOutcome(PendingOutcomeType.INVALIDATED)
+
+    if invalidated:
+        signal.status = SignalStatus.INVALIDATED
+        return PendingOutcome(PendingOutcomeType.INVALIDATED)
+
+    # ------------------------------------------------
+    # LOCATE ORIGINAL ZONE
+    # ------------------------------------------------
+
+    matching_visible_zone = None
+
+    zone_stable_key = getattr(signal, "zone_stable_key", None)
+
+    if zone_stable_key is not None:
+        for zone in visible_zones:
+            if _stable_cache_key(zone) != zone_stable_key:
+                continue
+            matching_visible_zone = zone
+            break
+
+    # Compatibility fallback when an older signal has no stable key
+    # but does have an explicit zone_id.
+    if matching_visible_zone is None:
+        signal_zone_id = getattr(signal, "zone_id", None)
+
+        if signal_zone_id is not None:
+            for zone in visible_zones:
+                if getattr(zone, "zone_id", None) == signal_zone_id:
+                    matching_visible_zone = zone
+                    break
+
+    if matching_visible_zone is None:
+        # Keep waiting until expiry.
+        return PendingOutcome(PendingOutcomeType.STILL_PENDING)
+
+    # ------------------------------------------------
+    # EXCLUDE MITIGATED ZONES
+    # ------------------------------------------------
+
+    zone_mitigated = bool(
+        getattr(matching_visible_zone, "mitigated", False)
+        or getattr(matching_visible_zone, "is_mitigated", False)
+    )
+
+    zone_mitigated_at = getattr(matching_visible_zone, "mitigated_at", None)
+
+    # Only exclude a zone that was ALREADY mitigated on a strictly
+    # earlier bar -- see backtest.py's original comment: requiring a
+    # STRICTLY earlier mitigation bar lets the coincident retest/
+    # mitigation bar still trigger correctly, while still excluding
+    # zones genuinely used up before this bar began.
+    zone_already_mitigated = bool(
+        zone_mitigated
+        and zone_mitigated_at is not None
+        and zone_mitigated_at < current_time
+    )
+
+    if zone_already_mitigated:
+        signal.status = SignalStatus.INVALIDATED
+        return PendingOutcome(PendingOutcomeType.INVALIDATED)
+
+    zone_top = float(matching_visible_zone.price_top)
+    zone_bottom = float(matching_visible_zone.price_bottom)
+
+    if zone_top <= zone_bottom:
+        signal.status = SignalStatus.INVALIDATED
+        return PendingOutcome(PendingOutcomeType.INVALIDATED)
+
+    # ------------------------------------------------
+    # AUTHORITATIVE RETEST
+    # ------------------------------------------------
+
+    if signal.signal_type == SignalType.LONG:
+        entry_touched = _long_retest_touched(current_low, zone_top)
+    else:
+        entry_touched = _short_retest_touched(current_high, zone_bottom)
+
+    if not entry_touched:
+        return PendingOutcome(PendingOutcomeType.STILL_PENDING)
+
+    # ------------------------------------------------
+    # TRIGGER
+    # ------------------------------------------------
+
+    signal.status = SignalStatus.TRIGGERED
+    signal.triggered_at_bar = int(current_index)
+    signal.triggered_at_time = current_time
+    signal.bars_to_trigger = int(bars_elapsed)
+
+    # ------------------------------------------------
+    # GAP-AWARE ACTUAL FILL
+    # ------------------------------------------------
+
+    planned_entry = float(signal.entry_price)
+
+    fill_price = _gap_aware_fill(
+        signal.signal_type,
+        planned_entry,
+        current_open,
+    )
+
+    initial_risk = abs(fill_price - float(signal.stop_loss))
+
+    if initial_risk <= EPSILON:
+        signal.status = SignalStatus.INVALIDATED
+        return PendingOutcome(PendingOutcomeType.INVALIDATED)
+
+    # ------------------------------------------------
+    # SYNCHRONIZE SIGNAL
+    # ------------------------------------------------
+
+    signal.entry_price = float(fill_price)
+    signal.recalculate_risk_reward()
+
+    return PendingOutcome(
+        outcome=PendingOutcomeType.TRIGGERED,
+        planned_entry=planned_entry,
+        fill_price=float(fill_price),
+        initial_risk=float(initial_risk),
+    )
+
+
+__all__ = [
+    "PendingOutcome",
+    "PendingOutcomeType",
+    "advance_pending_signal",
+]

@@ -1,11 +1,42 @@
-﻿.venv/
+﻿# Python environment and cache (rebuilt on any machine)
+.venv/
 __pycache__/
-*.pyc
-*.csv
-*.db
-*.sqlite3
-.env
+*.py[cod]
+.pytest_cache/
 
-*.db-shm
-*.db-wal
-*.bak
+# Secrets, never upload these
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Databases (binary, back up separately)
+*.db
+*.sqlite
+*.sqlite3
+*.db.bak
+*.parquet
+*.feather
+
+# Big data files (back up separately)
+real_gold_data*.csv
+your_data_file*.csv
+gold_orderflow/data/
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.tmp
+*.temp
+
+# Editor and OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+market_data/data/
+orderflow/market_data/data/
+
+market_data/data/
+orderflow/market_data/data/

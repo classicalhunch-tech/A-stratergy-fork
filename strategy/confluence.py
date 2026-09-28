@@ -1,4 +1,4 @@
-"""
+﻿"""
 strategy/confluence.py
 
 MTF Trend Guard & Confluence Filter.
@@ -9,9 +9,13 @@ and the higher-timeframe structural context.
 Responsibilities
 ----------------
 - Read the candidate direction produced by the 5M SMC engine.
-- Validate that the 4H macro structural trend agrees.
-- Validate that the 15M internal structural trend agrees.
+- Validate that the macro (1H) structural trend agrees.
+- Validate that the internal (15M) structural trend agrees.
 - Optionally allow an unestablished internal trend.
+- Optionally allow macro agreement to override an internal conflict
+  (soft_internal_conflict), since macro is the broad/primary context
+  and internal is a secondary, closer-in lens rather than a co-equal
+  veto.
 - Reject immediately when higher-timeframe structure opposes the
   candidate direction.
 - Preserve all source DataFrame columns and metadata.
@@ -47,27 +51,9 @@ NEUTRAL_INTERNAL_STATES = {
 
 
 def _normalize_state(value: Any) -> Optional[str]:
-    """
-    Normalize a signal or structural-state value.
-
-    Supported inputs include:
-    - plain strings
-    - Enum-like objects with `.value`
-    - objects exposing `.direction`
-    - objects exposing `.type`
-    - None
-    - NaN / pd.NA
-
-    Returns
-    -------
-    Optional[str]
-        Uppercase normalized state, or None when unavailable.
-    """
-
     if value is None:
         return None
 
-    # Handle scalar missing values safely.
     try:
         missing = pd.isna(value)
     except (TypeError, ValueError):
@@ -77,22 +63,12 @@ def _normalize_state(value: Any) -> Optional[str]:
         if missing:
             return None
     else:
-        # Non-scalar result from pd.isna(), e.g. an array-like object.
-        # It is not a valid state value for this filter.
         return None
-
-    # ---------------------------------------------------------
-    # 1. Enum-like values
-    # ---------------------------------------------------------
 
     value = getattr(value, "value", value)
 
     if value is None:
         return None
-
-    # ---------------------------------------------------------
-    # 2. Custom signal/state objects
-    # ---------------------------------------------------------
 
     if not isinstance(value, (str, int, float)):
         direction = getattr(value, "direction", None)
@@ -122,6 +98,7 @@ def _mtf_confluence_approved(
     macro_trend: Optional[str],
     internal_trend: Optional[str],
     allow_neutral_internal: bool,
+    soft_internal_conflict: bool = False,
 ) -> bool:
     """
     Single source of truth for the LONG/SHORT trend-agreement rule.
@@ -133,45 +110,51 @@ def _mtf_confluence_approved(
 
     so the two call paths can never silently drift apart.
 
-    LONG requires macro_trend == BULLISH, and either
-    internal_trend == BULLISH or (allow_neutral_internal and
-    internal_trend is unestablished).
+    Macro (1H) must always agree with the candidate direction; a
+    macro conflict is always a hard reject regardless of internal
+    state or soft_internal_conflict.
 
+    When soft_internal_conflict is False (default, original
+    behavior): internal (15M) must also not conflict. LONG requires
+    macro_trend == BULLISH, and either internal_trend == BULLISH or
+    (allow_neutral_internal and internal_trend is unestablished).
     SHORT is the mirror image with BEARISH.
+
+    When soft_internal_conflict is True: once macro agrees, an
+    actively conflicting internal trend no longer vetoes the signal
+    on its own -- macro (the broad/primary context) is treated as
+    sufficient. allow_neutral_internal has no additional effect in
+    this mode since macro agreement alone already approves.
     """
 
-    if base_signal == LONG:
-        macro_ok = macro_trend == BULLISH
+    if base_signal not in (LONG, SHORT):
+        return False
 
-        if allow_neutral_internal:
-            internal_ok = (
-                internal_trend == BULLISH
-                or internal_trend in NEUTRAL_INTERNAL_STATES
-            )
-        else:
-            internal_ok = internal_trend == BULLISH
+    want = BULLISH if base_signal == LONG else BEARISH
 
-        return macro_ok and internal_ok
+    macro_ok = macro_trend == want
 
-    if base_signal == SHORT:
-        macro_ok = macro_trend == BEARISH
+    if not macro_ok:
+        return False
 
-        if allow_neutral_internal:
-            internal_ok = (
-                internal_trend == BEARISH
-                or internal_trend in NEUTRAL_INTERNAL_STATES
-            )
-        else:
-            internal_ok = internal_trend == BEARISH
+    if soft_internal_conflict:
+        return True
 
-        return macro_ok and internal_ok
+    if allow_neutral_internal:
+        internal_ok = (
+            internal_trend == want
+            or internal_trend in NEUTRAL_INTERNAL_STATES
+        )
+    else:
+        internal_ok = internal_trend == want
 
-    return False
+    return internal_ok
 
 
 def apply_mtf_confluence_filter(
     df_enriched: pd.DataFrame,
     allow_neutral_internal: bool = True,
+    soft_internal_conflict: bool = False,
 ) -> pd.DataFrame:
     """
     Apply the MTF structural trend guard to 5M candidate setups
@@ -217,6 +200,7 @@ def apply_mtf_confluence_filter(
             macro_trend,
             internal_trend,
             allow_neutral_internal,
+            soft_internal_conflict,
         )
 
         final_signals.append(base_signal if approved else None)
@@ -229,23 +213,14 @@ def apply_mtf_confluence_filter(
 def build_mtf_signal_filter(
     df_enriched: pd.DataFrame,
     allow_neutral_internal: bool = True,
+    soft_internal_conflict: bool = False,
 ) -> Callable[[Any, pd.Timestamp], bool]:
     """
     Build a per-signal MTF confluence predicate for use as
     strategy.backtest.run_backtest()'s `mtf_filter_fn` hook.
 
-    Unlike apply_mtf_confluence_filter() (which processes a whole
-    DataFrame that already has a `base_signal` column), this builds
-    a live callable:
-
-        mtf_filter_fn(signal, current_time) -> bool
-
-    matching backtest.py's expected signature:
-        mtf_filter_fn: Optional[Callable[[TradeSignal, pd.Timestamp], bool]]
-
-    It reuses the exact same trend-agreement rule as
-    apply_mtf_confluence_filter() via _mtf_confluence_approved(), so
-    the two code paths cannot disagree.
+    See _mtf_confluence_approved() for the exact rule, including
+    the soft_internal_conflict behavior.
 
     Parameters
     ----------
@@ -255,7 +230,12 @@ def build_mtf_signal_filter(
         same 5M timestamps used during the backtest replay.
     allow_neutral_internal : bool
         Whether an unestablished 15M internal trend is treated as
-        non-blocking.
+        non-blocking. Only relevant when soft_internal_conflict is
+        False.
+    soft_internal_conflict : bool
+        When True, macro (1H) agreement alone approves the signal;
+        an actively conflicting internal (15M) trend no longer
+        vetoes it. Macro conflict is still always a hard reject.
 
     Returns
     -------
@@ -276,8 +256,6 @@ def build_mtf_signal_filter(
     if not isinstance(df_enriched.index, pd.DatetimeIndex):
         raise TypeError("df_enriched must have a DatetimeIndex.")
 
-    # Precompute an O(1) lookup table once, rather than re-scanning
-    # df_enriched on every signal check during the bar-by-bar replay.
     trend_lookup = {
         ts: (
             _normalize_state(macro),
@@ -293,15 +271,9 @@ def build_mtf_signal_filter(
     sorted_index = df_enriched.index.sort_values()
 
     def _lookup_trends(current_time: pd.Timestamp):
-        # Fast path: exact bar match (expected on every real call,
-        # since df_enriched is built directly from the same 5M index
-        # the backtest replays over).
         if current_time in trend_lookup:
             return trend_lookup[current_time]
 
-        # Fallback: as-of lookup (last known trend at or before
-        # current_time). Guards against a timestamp mismatch without
-        # ever looking ahead into future bars.
         position = sorted_index.searchsorted(current_time, side="right") - 1
 
         if position < 0:
@@ -323,6 +295,7 @@ def build_mtf_signal_filter(
             macro_trend,
             internal_trend,
             allow_neutral_internal,
+            soft_internal_conflict,
         )
 
     return mtf_filter_fn

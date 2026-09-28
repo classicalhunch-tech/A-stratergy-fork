@@ -405,7 +405,6 @@ class StrategyAdapter:
         self._mtf_soft_internal_conflict = mtf_soft_internal_conflict
         self._mtf_min_bars = mtf_min_bars
         self._mtf_filter_fn = None
-        self._mtf_df = None
 
         # --------------------------------------------------------
         # Causal candle history
@@ -587,11 +586,31 @@ class StrategyAdapter:
         # to advance through the normal retest state machine.
         # --------------------------------------------------------
 
-        # Lazy MTF: the filter is built only if a signal needs it this
-        # tick (see _get_mtf_filter). Same causal DataFrame, same result
-        # as eager building, without rebuilding on every candle.
-        self._mtf_df = df
-        self._mtf_filter_fn = None
+        if self._mtf_enabled:
+            if len(df) < self._mtf_min_bars:
+                self._mtf_filter_fn = lambda signal, ts: False
+            else:
+                try:
+                    df_enriched = build_mtf_dataset_with_structure(
+                        df,
+                        macro_swings_fn=self._mtf_swings_fn,
+                        internal_swings_fn=self._mtf_swings_fn,
+                        config=MTFConfig(
+                            macro_tf=self._mtf_macro_tf,
+                            internal_tf=self._mtf_internal_tf,
+                        ),
+                    )
+                    self._mtf_filter_fn = build_mtf_signal_filter(
+                        df_enriched,
+                        soft_internal_conflict=self._mtf_soft_internal_conflict,
+                    )
+                except Exception as exc:
+                    self._record_error(
+                        current_index,
+                        "mtf context",
+                        exc,
+                    )
+                    self._mtf_filter_fn = lambda signal, ts: False
 
         # --------------------------------------------------------
         # Existing strategy pipeline
@@ -1241,8 +1260,9 @@ class StrategyAdapter:
             return
 
         if self._mtf_enabled:
-            mtf_filter = self._get_mtf_filter(current_index)
-            if not mtf_filter(signal, current_time):
+            if self._mtf_filter_fn is None:
+                return
+            if not self._mtf_filter_fn(signal, current_time):
                 return
 
         self._registered_setup_keys.add(
@@ -1256,41 +1276,6 @@ class StrategyAdapter:
     # ============================================================
     # DIAGNOSTICS
     # ============================================================
-
-    def _get_mtf_filter(self, current_index: int):
-        """Build (once per tick, on demand) the MTF confluence filter.
-
-        FAIL-CLOSED: returns a reject-everything predicate when there is
-        too little history or MTF context building raises.
-        """
-        if self._mtf_filter_fn is not None:
-            return self._mtf_filter_fn
-
-        df = self._mtf_df
-
-        if df is None or len(df) < self._mtf_min_bars:
-            self._mtf_filter_fn = lambda signal, ts: False
-            return self._mtf_filter_fn
-
-        try:
-            df_enriched = build_mtf_dataset_with_structure(
-                df,
-                macro_swings_fn=self._mtf_swings_fn,
-                internal_swings_fn=self._mtf_swings_fn,
-                config=MTFConfig(
-                    macro_tf=self._mtf_macro_tf,
-                    internal_tf=self._mtf_internal_tf,
-                ),
-            )
-            self._mtf_filter_fn = build_mtf_signal_filter(
-                df_enriched,
-                soft_internal_conflict=self._mtf_soft_internal_conflict,
-            )
-        except Exception as exc:
-            self._record_error(current_index, "mtf context", exc)
-            self._mtf_filter_fn = lambda signal, ts: False
-
-        return self._mtf_filter_fn
 
     def _record_error(
         self,
