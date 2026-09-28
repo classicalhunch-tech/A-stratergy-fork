@@ -10,7 +10,7 @@ __pycache__/
 !.env.example
 .streamlit/secrets.toml
 
-# Databases (binary, back up separately)
+# Databases (back up separately)
 *.db
 *.sqlite
 *.sqlite3
@@ -22,6 +22,8 @@ __pycache__/
 real_gold_data*.csv
 your_data_file*.csv
 gold_orderflow/data/
+market_data/data/
+orderflow/market_data/data/
 
 # Logs and runtime files
 *.log
@@ -35,8 +37,3 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
-market_data/data/
-orderflow/market_data/data/
-
-market_data/data/
-orderflow/market_data/data/
