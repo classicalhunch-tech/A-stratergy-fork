@@ -12,6 +12,10 @@ Wires together:
     RuntimeCoordinator (Phase 3, reused as-is)
         ->
     LiveEventEngine (Phase 4)
+        ->
+    ExecutionEventConsumer (Phase 4)
+        ->
+    BrokerExecutor (Phase 4)
 
 Phase 3 remains responsible for its existing runtime behavior:
     SessionEngine
@@ -23,6 +27,8 @@ Phase 4 adds:
     ClockIntegrityChecker
     LiveEventEngine
     LiveMarketSource
+    ExecutionEventConsumer
+    BrokerExecutor
 
 IMPORTANT -- SESSION DECISIONS
 
@@ -81,6 +87,23 @@ it must receive a SafeModeGate explicitly. The runner therefore wires
 the durable, file-backed EmergencyKillSwitch here so every live cycle
 reads the current kill-switch state before exposing a triggered signal.
 
+IMPORTANT -- EXECUTION WIRING
+
+The execution consumer sits one layer below the event engine and
+consumes SIGNAL_TRIGGERED events only. It transforms them into
+ExecutionRequests, passes them through BrokerExecutor (which applies
+idempotency + kill-switch guard again), and returns ExecutionResults
+as ORDER_PLACED or ORDER_REJECTED events back into the event stream.
+
+This maintains clean separation:
+    - Phase 3: signal discovery and permission
+    - Phase 4 event engine: clock/quality/signal suppression
+    - Phase 4 executor: order safety (idempotency, guard checks)
+    - Phase 4 consumer: signal-to-execution transformation
+
+The consumer is optional (can be disabled or swapped out). The runner
+applies it to every event batch after the engine runs.
+
 USAGE:
 
     Smoke test:
@@ -88,6 +111,9 @@ USAGE:
 
     Continuous loop:
         python -m phase_04_live.main
+    
+    Dry run (no actual broker orders):
+        python -m phase_04_live.main --dry-run
 """
 
 from __future__ import annotations
@@ -108,6 +134,8 @@ from phase_03_paper.signals.adapter import StrategyAdapter
 from phase_04_live.clock.integrity import ClockIntegrityChecker
 from phase_04_live.clock.models import ClockIssue
 from phase_04_live.events.event_engine import LiveEventEngine
+from phase_04_live.execution.consumer import ExecutionEventConsumer
+from phase_04_live.execution.executor import BrokerExecutor, ExecutionConfig
 from phase_04_live.market.live_source import LiveMarketSource
 from phase_04_live.market.models import QualityIssue
 from phase_04_live.recovery.safe_mode import SafeModeGate
@@ -133,6 +161,10 @@ STALE_AFTER_MISSED_CANDLES = 2
 # Durable operator-controlled state. Missing file means the first-ever run
 # is allowed; malformed or unreadable existing state fails closed.
 KILL_SWITCH_PATH = Path("state/kill_switch.json")
+
+# Broker execution configuration
+EXECUTOR_MAX_ORDER_SIZE = 0.1  # Max notional per order
+EXECUTOR_ORDER_TIMEOUT_SECONDS = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +300,41 @@ def build_event_engine() -> tuple[LiveEventEngine, LiveMarketSource]:
     return engine, live_source
 
 
+def build_execution_consumer(
+    kill_switch: EmergencyKillSwitch,
+    safe_mode_gate: SafeModeGate,
+    enable_dry_run: bool = False,
+    order_sink: Optional[Callable] = None,
+) -> ExecutionEventConsumer:
+    """
+    Build the execution consumer and broker executor.
+    
+    The executor is optional and can be disabled by passing dry_run=True
+    or by not providing an order_sink. In both cases, orders are logged
+    but not sent to the broker.
+    """
+    
+    executor_config = ExecutionConfig(
+        max_order_size=EXECUTOR_MAX_ORDER_SIZE,
+        order_timeout_seconds=EXECUTOR_ORDER_TIMEOUT_SECONDS,
+        enable_dry_run=enable_dry_run,
+    )
+    
+    broker_executor = BrokerExecutor(
+        kill_switch=kill_switch,
+        safe_mode_gate=safe_mode_gate,
+        config=executor_config,
+        order_sink=order_sink,
+    )
+    
+    consumer = ExecutionEventConsumer(
+        broker_executor=broker_executor,
+        symbol=SYMBOL,
+    )
+    
+    return consumer
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -291,9 +358,30 @@ def main() -> int:
         help="Run exactly one live cycle and exit.",
     )
 
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log orders instead of sending them to the broker.",
+    )
+
     args = parser.parse_args()
 
     engine, live_source = build_event_engine()
+
+    # Extract kill_switch and safe_mode_gate from engine for executor wiring
+    # (they were built inside build_event_engine; in production, we'd expose
+    # them as return values. For now, we rebuild them here -- the state file
+    # is the single source of truth, so rebuilding is safe and idempotent).
+    kill_switch = EmergencyKillSwitch(KILL_SWITCH_PATH)
+    safe_mode_gate = SafeModeGate(kill_switch)
+
+    # Build execution consumer (optional; can be disabled)
+    execution_consumer = build_execution_consumer(
+        kill_switch=kill_switch,
+        safe_mode_gate=safe_mode_gate,
+        enable_dry_run=args.dry_run,
+        order_sink=None,  # Implement your broker order submission here
+    )
 
     # Connect MT5 explicitly, BEFORE the first cycle runs. Do not
     # rely on LiveMarketSource's lazy internal connect() here -- see
@@ -307,6 +395,10 @@ def main() -> int:
         if args.once:
             print(f"Running ONE live cycle for {SYMBOL} {TIMEFRAME}...")
             events = engine.run_once()
+            
+            # Apply execution consumer to the event stream
+            events = execution_consumer.consume(events)
+            
             print(f"Cycle complete. {len(events)} event(s) produced:")
             for event in events:
                 print(f"  {event.event_type.value} @ {event.occurred_at} -> {event.payload}")
@@ -314,9 +406,20 @@ def main() -> int:
 
         print(f"Running live loop for {SYMBOL} {TIMEFRAME} (poll every {POLL_INTERVAL_SECONDS}s).")
         print("Session decisions remain under the existing Phase 3 session gate; this runner does not auto-approve them.")
+        print(f"Execution mode: {'DRY-RUN' if args.dry_run else 'LIVE'}")
 
         try:
-            engine.run_forever()
+            while True:
+                events = engine.run_once()
+                
+                # Apply execution consumer to the event stream
+                events = execution_consumer.consume(events)
+                
+                for event in events:
+                    print(f"{event.event_type.value} @ {event.occurred_at}")
+                
+                import time
+                time.sleep(engine.poll_interval_seconds)
         except KeyboardInterrupt:
             print("\nStopped by user.")
 
