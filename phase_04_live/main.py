@@ -74,6 +74,13 @@ and raises "No IPC connection". The fix is NOT to reorder the clock
 check (that would defeat its purpose); it's to connect MT5 explicitly
 at startup, before either subsystem needs it -- see main() below.
 
+IMPORTANT -- KILL-SWITCH WIRING
+
+The live event engine owns the final safe-mode check for signals, but
+it must receive a SafeModeGate explicitly. The runner therefore wires
+the durable, file-backed EmergencyKillSwitch here so every live cycle
+reads the current kill-switch state before exposing a triggered signal.
+
 USAGE:
 
     Smoke test:
@@ -88,6 +95,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 from phase_03_paper.events.audit import AuditLog
@@ -102,6 +110,8 @@ from phase_04_live.clock.models import ClockIssue
 from phase_04_live.events.event_engine import LiveEventEngine
 from phase_04_live.market.live_source import LiveMarketSource
 from phase_04_live.market.models import QualityIssue
+from phase_04_live.recovery.safe_mode import SafeModeGate
+from phase_04_live.risk.kill_switch import EmergencyKillSwitch
 
 
 logger = logging.getLogger(__name__)
@@ -119,6 +129,10 @@ POLL_INTERVAL_SECONDS = 5.0
 CLOCK_CHECK_INTERVAL_SECONDS = 30.0
 MAX_DRIFT_SECONDS = 2.0
 STALE_AFTER_MISSED_CANDLES = 2
+
+# Durable operator-controlled state. Missing file means the first-ever run
+# is allowed; malformed or unreadable existing state fails closed.
+KILL_SWITCH_PATH = Path("state/kill_switch.json")
 
 
 # ---------------------------------------------------------------------------
@@ -230,16 +244,23 @@ def build_event_engine() -> tuple[LiveEventEngine, LiveMarketSource]:
         on_issue=handle_clock_issue,
     )
 
-    # 6. Assemble LiveEventEngine
+    # 6. Build the durable kill-switch gate. SafeModeGate performs a
+    #    fresh read on every signal, so operator changes are visible
+    #    without restarting the process.
+    kill_switch = EmergencyKillSwitch(KILL_SWITCH_PATH)
+    safe_mode_gate = SafeModeGate(kill_switch)
+
+    # 7. Assemble LiveEventEngine with the safety gate wired in.
     engine = LiveEventEngine(
         coordinator=coordinator,
         clock_checker=clock_checker,
         timeframe=TIMEFRAME,
         poll_interval_seconds=POLL_INTERVAL_SECONDS,
         clock_check_interval_seconds=CLOCK_CHECK_INTERVAL_SECONDS,
+        safe_mode_gate=safe_mode_gate,
     )
 
-    # 7. Now that the engine exists, bind the relay to it so every
+    # 8. Now that the engine exists, bind the relay to it so every
     #    QualityIssue raised inside live_source's stream() reaches
     #    the engine's ordered event stream, not just the log line.
     quality_relay.bind(engine.on_quality_issue)
