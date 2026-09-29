@@ -40,25 +40,36 @@ class QualityFilter:
         self._on_issue = on_issue
 
     def check(self, candle: Candle) -> tuple[bool, Optional[QualityIssue]]:
+        """
+        Check if a candle is acceptable for the live feed.
+        
+        Returns (accepted: bool, issue: QualityIssue | None):
+            - (True, None): candle passed all checks
+            - (False, issue): candle failed a check and is rejected
+        
+        All checks are applied in order. The first failure causes rejection.
+        Gap checks are FATAL -- discontinuous data must be rejected.
+        """
+        # All checks in order: price, OHLC consistency, ordering, and gaps.
+        # Any failure causes immediate rejection.
         issue = (
             self._check_price_validity(candle)
             or self._check_ohlc_consistency(candle)
             or self._check_ordering(candle)
+            or self._check_gap(candle)
         )
 
         if issue is not None:
             self._raise(issue)
             return False, issue
 
-        gap_issue = self._check_gap(candle)
-        if gap_issue is not None:
-            self._raise(gap_issue)
-
+        # Candle passed all checks -- update state and accept it
         key = (candle.symbol, candle.timeframe)
         self._last_accepted[key] = candle
         return True, None
 
     def _check_price_validity(self, candle: Candle) -> Optional[QualityIssue]:
+        """Reject candles with zero or negative prices."""
         if candle.open <= 0 or candle.high <= 0 or candle.low <= 0 or candle.close <= 0:
             return self._make_issue(
                 QualityIssueType.ZERO_OR_NEGATIVE_PRICE,
@@ -69,6 +80,7 @@ class QualityFilter:
         return None
 
     def _check_ohlc_consistency(self, candle: Candle) -> Optional[QualityIssue]:
+        """Reject candles with invalid OHLC relationships."""
         if candle.high < candle.low:
             return self._make_issue(
                 QualityIssueType.INVALID_OHLC,
@@ -90,6 +102,7 @@ class QualityFilter:
         return None
 
     def _check_ordering(self, candle: Candle) -> Optional[QualityIssue]:
+        """Reject duplicate or out-of-order candles."""
         key = (candle.symbol, candle.timeframe)
         last = self._last_accepted.get(key)
         if last is None:
@@ -111,6 +124,21 @@ class QualityFilter:
         return None
 
     def _check_gap(self, candle: Candle) -> Optional[QualityIssue]:
+        """
+        Reject candles with missing data gaps.
+        
+        A gap means one or more candles are missing in the feed.
+        This is a FATAL condition in live trading because discontinuous
+        data can break technical analysis and lead to false signals.
+        
+        Gaps indicate:
+        - Feed interruption (network issue, broker outage)
+        - Subscription/connection problem
+        - Data synchronization failure
+        
+        Rejecting gap candles ensures the strategy engine is only fed
+        continuous, reliable data.
+        """
         key = (candle.symbol, candle.timeframe)
         last = self._last_accepted.get(key)
         if last is None:
@@ -127,7 +155,8 @@ class QualityFilter:
                 QualityIssueType.TIMEFRAME_GAP,
                 candle,
                 f"Gap detected: ~{missing} candle(s) missing between "
-                f"{last.timestamp} and {candle.timestamp}",
+                f"{last.timestamp} and {candle.timestamp} "
+                f"(expected step {expected_step}s, got {actual_step:.0f}s)",
             )
         return None
 
@@ -144,3 +173,4 @@ class QualityFilter:
     def _raise(self, issue: QualityIssue) -> None:
         if self._on_issue is not None:
             self._on_issue(issue)
+
