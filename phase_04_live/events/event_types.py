@@ -2,13 +2,13 @@
 phase_04_live/events/event_types.py
 
 Unified event shape for everything the Phase 4 live loop surfaces in
-one cycle: clock issues, market quality issues, and whatever
-RuntimeCoordinator already produces (triggered/suppressed signals,
+one cycle: clock issues, market quality issues, execution results, and
+whatever RuntimeCoordinator already produces (triggered/suppressed signals,
 adapter errors, tick errors).
 
 This does NOT replace RuntimeCoordinator's own event handling (queued
 triggered events, audit log) -- it wraps those alongside the
-phase_04_live-specific event types (clock/quality) that
+phase_04_live-specific event types (clock/quality/execution) that
 RuntimeCoordinator has no knowledge of, so monitoring/ has one
 consistent stream to read from instead of three separate sources.
 """
@@ -27,6 +27,9 @@ class LiveEventType(str, Enum):
     ADAPTER_ERROR = "ADAPTER_ERROR"
     SIGNAL_TRIGGERED = "SIGNAL_TRIGGERED"
     SIGNAL_SUPPRESSED = "SIGNAL_SUPPRESSED"
+    ORDER_PLACED = "ORDER_PLACED"
+    ORDER_REJECTED = "ORDER_REJECTED"
+    ORDER_ERROR = "ORDER_ERROR"
 
 
 @dataclass(frozen=True)
@@ -35,9 +38,9 @@ class LiveEvent:
     One normalized event for the live loop's output stream.
 
     payload holds the original object (ClockIssue, QualityIssue,
-    AdapterSignalEvent, or a raw error string) -- LiveEvent itself is
-    just a consistent envelope, it does not replace or reinterpret
-    the original data.
+    AdapterSignalEvent, ExecutionResult, or a raw error string) --
+    LiveEvent itself is just a consistent envelope, it does not replace
+    or reinterpret the original data.
     """
     event_type: LiveEventType
     occurred_at: datetime
