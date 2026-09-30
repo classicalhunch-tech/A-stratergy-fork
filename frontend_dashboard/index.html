@@ -817,7 +817,7 @@ $('savePaperRisk').addEventListener('click', async () => {
       fixed_lot_size: parseFloat($('paperFixedLot').value) || 0.01
     });
     state.paperRisk = updated;
-    alert('Paper risk config updated in-memory!');
+    console.log('Paper risk config updated in-memory!';
   } catch (e) { alert('Failed: ' + e.message); }
 });
 
@@ -837,8 +837,8 @@ $('saveLiveRisk').addEventListener('click', async () => {
       fixed_lot_size: parseFloat($('liveFixedLot').value) || 0.01
     });
     state.liveRisk = updated;
-    alert('Live risk config updated in-memory!');
-  } catch (e) { alert('Failed: ' + e.message); }
+    console.log('Live risk config updated in-memory!');
+  } catch (e) { console.error('Failed: ' + e.message); }
 });
 
 $('toggleLiveRun').addEventListener('click', async () => {
@@ -847,7 +847,7 @@ $('toggleLiveRun').addEventListener('click', async () => {
     const updated = await postJSON('/api/live/control', { action: currentRunning ? 'stop' : 'start' });
     state.liveRisk = updated;
     renderLivePage();
-  } catch (e) { alert('Failed: ' + e.message); }
+  } catch (e) { console.error('Failed: ' + e.message); }
 });
 
 /* ---------------- copilot ---------------- */
