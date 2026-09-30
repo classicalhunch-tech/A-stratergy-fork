@@ -60,6 +60,11 @@ from phase_03_paper.trading.paper_engine import (
 from strategy.signals import SignalType
 
 
+# Repo root, derived from this file's location -- invariant to cwd.
+# phase_03_paper/persistence/persistence.py -> parents[2] == repo root.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     trade_id        TEXT PRIMARY KEY,
@@ -136,7 +141,15 @@ class Persistence:
     """
 
     def __init__(self, db_path: Union[str, Path]) -> None:
-        self._db_path = str(db_path)
+        # Anchor relative db_path to PROJECT_ROOT (repo root), not cwd.
+        # A cwd-relative path silently creates/opens a different DB
+        # depending on where the process was launched from -- which can
+        # disagree with the read-only reader in frontend_dashboard/server.py.
+        path = Path(db_path)
+        if not path.is_absolute():
+            path = _PROJECT_ROOT / path
+        self._db_path = str(path)
+
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
             conn.commit()
