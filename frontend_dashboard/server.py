@@ -1,4 +1,4 @@
-﻿"""
+"""
 frontend_dashboard/server.py
 
 Read-only FastAPI bridge over:
@@ -71,9 +71,6 @@ from phase_03_paper.config import DEFAULT_CONFIG as PHASE3_DEFAULT_CONFIG
 from phase_03_paper.sessions.engine import SessionEngine
 from phase_03_paper.models import SessionDecision, SessionStatus
 
-PHASE4_DB_PATH = "phase_04_live.db"
-PHASE3_DB_PATH = "phase_03_paper/data/phase3_paper.db"
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = Path(__file__).resolve().parent
 CANDLE_CSV_PATH = PROJECT_ROOT / "real_gold_data_mt5_5000.csv"
@@ -81,6 +78,15 @@ LOG_DIR = PROJECT_ROOT / "logs"
 STATE_DIR = PROJECT_ROOT / "state"
 PAPER_PID_FILE = STATE_DIR / "paper_loop.json"
 PAPER_RISK_CONFIG_FILE = STATE_DIR / "paper_risk_config.json"
+
+# DB paths are anchored to PROJECT_ROOT (not left as cwd-relative strings)
+# so they resolve to the same files regardless of where uvicorn was
+# launched from. Matches the anchoring already used by CANDLE_CSV_PATH,
+# LOG_DIR, STATE_DIR above. A cwd-relative path silently opens a
+# different DB if a stale copy exists at the launch directory -- and
+# mode=ro only blocks creation, not misdirection.
+PHASE4_DB_PATH = str(PROJECT_ROOT / "phase_04_live.db")
+PHASE3_DB_PATH = str(PROJECT_ROOT / "phase_03_paper" / "data" / "phase3_paper.db")
 
 _session_engine = SessionEngine(config=PHASE3_DEFAULT_CONFIG)
 
