@@ -1,4 +1,4 @@
-﻿"""
+"""
 phase_04_live/persistence/store.py
 
 Durable SQLite-backed state for Phase 4 -- restart-safe idempotency,
@@ -56,6 +56,11 @@ from phase_04_live.execution.idempotency import (
 )
 from phase_04_live.orders.order_manager import OrderRequest
 from phase_04_live.reconciliation.discrepancies import ExpectedPosition
+
+
+# Repo root, derived from this file's location -- invariant to cwd.
+# phase_04_live/persistence/store.py -> parents[2] == repo root.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 _SCHEMA = """
@@ -154,7 +159,14 @@ class Phase4Persistence:
     """
 
     def __init__(self, db_path: Union[str, Path]) -> None:
-        self._db_path = str(db_path)
+        # Anchor relative db_path to PROJECT_ROOT (repo root), not cwd.
+        # A cwd-relative path silently creates/opens a different DB
+        # depending on where the process was launched from -- which can
+        # disagree with the read-only reader in frontend_dashboard/server.py.
+        path = Path(db_path)
+        if not path.is_absolute():
+            path = _PROJECT_ROOT / path
+        self._db_path = str(path)
 
         with closing(self._connect()) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
