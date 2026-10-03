@@ -1,8 +1,13 @@
 # Python environment and cache (rebuilt on any machine)
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
 
 # Secrets, never upload these
 .env
