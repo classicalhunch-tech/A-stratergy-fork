@@ -75,8 +75,6 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-import MetaTrader5 as mt5
-
 from phase_03_paper.signals.adapter import AdapterSignalEvent
 from strategy.signals import SignalType
 
@@ -188,6 +186,8 @@ def get_symbol_trading_specs(symbol: str) -> SymbolTradingSpecs:
     Raises RuntimeError if the symbol isn't found or MT5 isn't
     connected.
     """
+    import MetaTrader5 as mt5
+
     info = mt5.symbol_info(symbol)
 
     if info is None:
@@ -231,6 +231,8 @@ def get_account_info() -> AccountInfo:
     starting_balance -- that field simulates a static paper balance;
     this reads the real, live, changing account state.
     """
+    import MetaTrader5 as mt5
+
     account = mt5.account_info()
 
     if account is None:
