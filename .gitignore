@@ -1,4 +1,4 @@
-﻿# Python environment and cache (rebuilt on any machine)
+# Python environment and cache (rebuilt on any machine)
 .venv/
 __pycache__/
 *.py[cod]
@@ -26,14 +26,31 @@ market_data/data/
 orderflow/market_data/data/
 
 # Logs and runtime files
+/logs/
 *.log
-logs/
 *.pid
 *.tmp
 *.temp
+
+# Backups and temporary files
+*.bak
+*.bak2
+*.bak3
+
+# Generated outputs
+mtf_trades_*.csv
+orderflow_research.csv
+diagnosis_output.txt
+core_strategy_dump.txt
+
+# State and runtime directories
+/state/
 
 # Editor and OS junk
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Keep this tracked
+!data/master_historical_data.csv
