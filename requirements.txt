@@ -1,5 +1,6 @@
-pandas
-numpy
-pytest
+pandas==3.0.6
+numpy==2.4.6
+pytest==9.1.1
 MetaTrader5; sys_platform == "win32"
-# TODO: add the dashboard server packages and pin versions after confirming they work
+# Versions above were tested on Linux, Python 3.11.16.
+# TODO: pin MetaTrader5 and the dashboard server packages once confirmed on the new laptop.
