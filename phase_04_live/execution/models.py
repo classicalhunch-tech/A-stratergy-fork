@@ -44,7 +44,7 @@ class ExecutionRequest:
     # Order details
     order_type: str                 # "BUY" or "SELL"
     entry_price: float              # Execution price
-    initial_risk: float             # Risk in account units
+    initial_risk: float             # Stop distance in PRICE units: abs(entry - stop). NOT account currency.
     
     # Timing
     signal_generated_at: datetime   # When the signal was created
@@ -53,6 +53,13 @@ class ExecutionRequest:
     # Idempotency key: stable hash of signal + price + risk
     # Allows safe replay without duplicate orders
     idempotency_key: Optional[str] = None
+
+    # Protective and sizing fields. Optional so older callers keep working.
+    # They are NOT part of the idempotency key.
+    stop_loss: Optional[float] = None    # Stop price
+    take_profit: Optional[float] = None  # Target price
+    volume: Optional[float] = None       # Order size in lots
+    magic: Optional[int] = None          # Broker magic number (order tag)
     
     def compute_idempotency_key(self) -> str:
         """
