@@ -1,4 +1,3 @@
-
 """
 phase_04_live/market/quality.py
 
@@ -9,6 +8,15 @@ Policy (per project decision): a bad candle is DROPPED, never passed
 through, and a QualityIssue is raised for monitoring to pick up.
 This module never halts the feed and never silently swallows a
 problem -- every drop produces a QualityIssue.
+
+GAP POLICY: by default (reject_gaps=True) a candle that follows a gap
+is dropped. NOTE that a dropped candle does not update the last
+accepted candle, so with this default the feed stays blocked after the
+first gap (weekend, daily market break, outage) until restart. The
+live source therefore uses reject_gaps=False: the gap is still
+reported as a QualityIssue, but the candle is accepted and becomes the
+new baseline. Real market data contains weekend and break gaps too,
+and the backtest data does as well.
 """
 
 from datetime import datetime, timezone
@@ -35,9 +43,14 @@ class QualityFilter:
     the feed delivers them. Returns (accepted: bool, issue: QualityIssue | None).
     """
 
-    def __init__(self, on_issue: Optional[Callable[[QualityIssue], None]] = None):
+    def __init__(
+        self,
+        on_issue: Optional[Callable[[QualityIssue], None]] = None,
+        reject_gaps: bool = True,
+    ):
         self._last_accepted: dict[tuple[str, str], Candle] = {}
         self._on_issue = on_issue
+        self._reject_gaps = reject_gaps
 
     def check(self, candle: Candle) -> tuple[bool, Optional[QualityIssue]]:
         """
@@ -46,27 +59,39 @@ class QualityFilter:
         Returns (accepted: bool, issue: QualityIssue | None):
             - (True, None): candle passed all checks
             - (False, issue): candle failed a check and is rejected
-        
-        All checks are applied in order. The first failure causes rejection.
-        Gap checks are FATAL -- discontinuous data must be rejected.
+            - (True, issue): only when reject_gaps is False and the
+              candle follows a gap; the gap is reported (also through
+              the on_issue callback) but the candle is accepted
+
+        All checks are applied in order. The first failure causes rejection,
+        except gap issues when reject_gaps is False.
         """
-        # All checks in order: price, OHLC consistency, ordering, and gaps.
-        # Any failure causes immediate rejection.
+        # Price, OHLC consistency and ordering problems always cause rejection.
         issue = (
             self._check_price_validity(candle)
             or self._check_ohlc_consistency(candle)
             or self._check_ordering(candle)
-            or self._check_gap(candle)
         )
 
         if issue is not None:
             self._raise(issue)
             return False, issue
 
-        # Candle passed all checks -- update state and accept it
+        # Gap check. With reject_gaps=True the candle is dropped (and the
+        # baseline is NOT updated). With reject_gaps=False the gap is
+        # reported but the candle is accepted.
+        gap_issue = self._check_gap(candle)
+
+        if gap_issue is not None:
+            self._raise(gap_issue)
+
+            if self._reject_gaps:
+                return False, gap_issue
+
+        # Candle passed (or its gap was tolerated) -- update state and accept it
         key = (candle.symbol, candle.timeframe)
         self._last_accepted[key] = candle
-        return True, None
+        return True, gap_issue
 
     def _check_price_validity(self, candle: Candle) -> Optional[QualityIssue]:
         """Reject candles with zero or negative prices."""
@@ -125,19 +150,17 @@ class QualityFilter:
 
     def _check_gap(self, candle: Candle) -> Optional[QualityIssue]:
         """
-        Reject candles with missing data gaps.
+        Detect missing data between the last accepted candle and this one.
         
         A gap means one or more candles are missing in the feed.
-        This is a FATAL condition in live trading because discontinuous
-        data can break technical analysis and lead to false signals.
-        
         Gaps indicate:
+        - Normal market closures (weekend, daily break)
         - Feed interruption (network issue, broker outage)
         - Subscription/connection problem
         - Data synchronization failure
-        
-        Rejecting gap candles ensures the strategy engine is only fed
-        continuous, reliable data.
+
+        Whether a gap candle is rejected or accepted is decided by the
+        reject_gaps setting (see the module docstring).
         """
         key = (candle.symbol, candle.timeframe)
         last = self._last_accepted.get(key)
@@ -173,4 +196,3 @@ class QualityFilter:
     def _raise(self, issue: QualityIssue) -> None:
         if self._on_issue is not None:
             self._on_issue(issue)
-
