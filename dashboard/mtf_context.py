@@ -25,7 +25,7 @@ import pandas as pd
 @dataclass(frozen=True)
 class MTFConfig:
     """Which higher timeframes to generate, in your top-down order."""
-    macro_tf: str = "4h"        # narrative / extreme zones
+    macro_tf: str = "1h"        # narrative / extreme zones
     internal_tf: str = "15min"  # internal structure
     base_interval: str = "5min" # explicit base timeframe spacing
     origin: str = "start_day"
