@@ -1,12 +1,15 @@
 name: check
 on:
   push:
-    branches: [feature/multi-timeframe]
+    branches: [main, feature/multi-timeframe]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       PYTHONPATH: .
@@ -23,35 +26,51 @@ jobs:
           pip install pandas numpy pytest streamlit
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: 1. Baseline backtest (main.py)
+      - name: 1. Backtest (main.py) and which version it is
         continue-on-error: true
-        run: python main.py --data data/master_historical_data.csv
+        run: |
+          grep -nE 'MTF_MACRO_TF|MTF_INTERNAL_TF' main.py || echo "main.py is the OLD version (default 4h macro)"
+          python main.py --data data/master_historical_data.csv
 
       - name: 2. Tracked files that .gitignore would ignore
         continue-on-error: true
         run: git ls-files -ci --exclude-standard
 
-      - name: 3. Secrets scan (file and line only, values hidden)
+      - name: 3. Data sanity (is the CSV real broker data?)
         continue-on-error: true
         run: |
-          git grep -nEi '(password|passwd|secret|api[_-]?key|token|mt5\.login|mt5\.initialize)' -- '*.py' '*.json' '*.toml' '*.txt' '*.cfg' '*.ini' '*.md' '*.ps1' | cut -d: -f1,2 | head -100 || true
-          git ls-files | grep -Ei '(^|/)\.env' || echo "no .env files tracked"
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/master_historical_data.csv", index_col=0, parse_dates=True)
+          gaps = df.index.to_series().diff().dropna()
+          print("rows:", len(df), "| range:", df.index[0], "->", df.index[-1])
+          print("columns:", list(df.columns))
+          print("gaps longer than 30 min:", int((gaps > pd.Timedelta(minutes=30)).sum()))
+          print("candles on Saturday:", int((df.index.dayofweek == 5).sum()))
+          EOF
 
-      - name: 4. Timezone handling in code
-        continue-on-error: true
-        run: |
-          git grep -nE 'tz_localize|tz_convert|timezone|utc' -- '*.py' | head -80 || true
-          git grep -n 'master_historical_data' | head -20 || true
-
-      - name: 5. Tests (excluding the look-ahead test)
+      - name: 4. Tests (excluding the look-ahead test)
         continue-on-error: true
         run: pytest -q -s tests --ignore=tests/test_mtf_causality.py 2>&1 | tail -80
 
-      - name: 6. Third-party imports used in the repo
+      - name: 5. Third-party imports used in the repo
         continue-on-error: true
         run: |
           git grep -hE '^\s*(import|from)\s+[A-Za-z_]' -- '*.py' | sed -E 's/^\s+//' | awk '{print $2}' | cut -d. -f1 | sort | uniq -c | sort -rn | head -60
 
-      - name: 7. MTF look-ahead test
+      - name: 6. MTF look-ahead test
         continue-on-error: true
         run: python tests/test_mtf_causality.py
+
+      - name: 7. Hard-coded credentials check (file and line only)
+        continue-on-error: true
+        run: |
+          git grep -nPi '(password|passwd|api[_-]?key|secret|token)\w*\s*[:=]\s*["\x27][^"\x27]{4,}["\x27]' -- '*.py' '*.json' '*.toml' '*.cfg' '*.ini' '*.ps1' 2>&1 | cut -d: -f1,2 | head -50 || true
+          git grep -nPi 'login\s*[:=]\s*[0-9]{5,}' -- '*.py' '*.json' '*.toml' '*.cfg' '*.ini' 2>&1 | cut -d: -f1,2 | head -50 || true
+          git ls-files | grep -Ei '(^|/)\.env' || echo "no .env files tracked"
+          echo "credentials check done"
+
+      - name: 8. Time handling in live and paper code
+        continue-on-error: true
+        run: |
+          git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime' -- 'phase_04_live/*.py' 'phase_03_paper/*.py' | head -80 || true
