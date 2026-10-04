@@ -76,3 +76,7 @@ jobs:
           git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime|TIMEFRAME' -- phase_04_live ':!*test*' | head -120 || true
           echo "----- phase_03_paper/config.py -----"
           sed -n '1,170p' phase_03_paper/config.py
+
+      - name: 9. Syntax check of live code (cannot be imported on Linux)
+        continue-on-error: true
+        run: python -m py_compile phase_04_live/main.py phase_04_live/market/live_source.py phase_04_live/broker/mt5.py && echo "syntax OK"
