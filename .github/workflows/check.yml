@@ -80,3 +80,22 @@ jobs:
       - name: 9. Syntax check of live code (cannot be imported on Linux)
         continue-on-error: true
         run: python -m py_compile phase_04_live/main.py phase_04_live/market/live_source.py phase_04_live/broker/mt5.py && echo "syntax OK"
+
+      - name: 10. Verification greps and tested package versions
+        continue-on-error: true
+        run: |
+          echo "----- python and package versions (the tested set) -----"
+          python --version
+          pip freeze | grep -iE '^(pandas|numpy|pytest|python-dateutil)==' || true
+          echo "----- live source: reject_gaps -----"
+          grep -n "reject_gaps" phase_04_live/market/live_source.py || echo "live_source.py does NOT pass reject_gaps"
+          echo "----- callers of .check( in code -----"
+          git grep -n '\.check(' -- phase_04_live phase_03_paper strategy | head -40 || true
+          echo "----- live base timeframe -----"
+          grep -n "TIMEFRAME" phase_04_live/main.py | head -10 || true
+          echo "----- who uses strategy/rules.py (TradingRules) -----"
+          git grep -nE 'strategy\.rules|TradingRules' -- '*.py' | head -20 || true
+          echo "----- MTFConfig defaults -----"
+          grep -nE 'macro_tf|internal_tf|base_interval|origin' dashboard/mtf_context.py | head -20 || true
+          echo "----- paper risk config -----"
+          head -60 state/paper_risk_config.json || true
