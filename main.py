@@ -44,6 +44,14 @@ from every existing test. When provided, only MTF-approved signals
 proceed to entry/retest/execution. No execution logic is duplicated
 here -- the confluence gate is checked, then the same tested engine
 runs exactly as it always has.
+
+Trading costs
+-------------
+--spread, --slippage and --commission are passed straight through to
+run_backtest(). All three are in PRICE UNITS (for XAUUSD, 0.30 means
+30 cents) and default to 0.0, which reproduces the original cost-free
+result exactly. The round-trip cost deducted from each closed trade is
+spread + (2 * slippage) + commission.
 """
 
 import argparse
@@ -196,6 +204,9 @@ def run_mtf_gated_backtest(
     df_5m: pd.DataFrame,
     df_enriched: pd.DataFrame,
     allow_neutral_internal: bool = True,
+    spread: float = 0.0,
+    slippage: float = 0.0,
+    commission: float = 0.0,
 ):
     """
     Run the SAME tested run_backtest() engine used by Phase 1/2/3,
@@ -207,6 +218,9 @@ def run_mtf_gated_backtest(
     a fresh signal would otherwise be registered as pending. The
     trade lifecycle itself (retest, trigger, SL/TP, WIN/LOSS/OPEN)
     is untouched, tested code.
+
+    spread, slippage and commission are in price units and are passed
+    straight through to run_backtest(). All default to 0.0.
     """
 
     mtf_filter_fn = build_mtf_signal_filter(
@@ -217,16 +231,29 @@ def run_mtf_gated_backtest(
     result = run_backtest(
         df_5m,
         mtf_filter_fn=mtf_filter_fn,
+        spread=spread,
+        slippage=slippage,
+        commission=commission,
+    )
+
+    closed_count = sum(
+        1 for t in result.trades
+        if t.result_status in {"WIN", "LOSS"}
     )
 
     print("--------------------------------------------------")
     print("MTF-GATED BACKTEST COMPLETE")
     print("--------------------------------------------------")
+    print(
+        "Costs (price units):              "
+        f"spread={spread} slippage={slippage} commission={commission}"
+    )
     print(f"Signals generated (MTF-approved): {result.total_signals_generated}")
     print(f"Rejected by MTF confluence:       {result.total_mtf_rejected}")
     print(f"Triggered:                        {result.total_trades_triggered}")
     print(f"Invalidated:                      {result.total_invalidated}")
     print(f"Expired:                          {result.total_expired}")
+    print(f"Closed trades (WIN/LOSS):         {closed_count}")
     print(f"Win rate:                         {result.win_rate:.2f}%")
     print(f"Expectancy:                       {result.expectancy:.4f}R")
 
@@ -266,6 +293,27 @@ def main():
         help="Reject signals when internal (15M) trend is neutral, instead of allowing them.",
     )
 
+    parser.add_argument(
+        "--spread",
+        type=float,
+        default=0.0,
+        help="Spread per round trip in price units (XAUUSD: 0.30 = 30 cents). Default 0.0.",
+    )
+
+    parser.add_argument(
+        "--slippage",
+        type=float,
+        default=0.0,
+        help="Adverse slippage per side in price units. Applied on entry and exit. Default 0.0.",
+    )
+
+    parser.add_argument(
+        "--commission",
+        type=float,
+        default=0.0,
+        help="Total round-trip commission in price units. Default 0.0.",
+    )
+
     args = parser.parse_args()
 
     start_time = time.perf_counter()
@@ -287,6 +335,9 @@ def main():
             df_5m,
             df_enriched,
             allow_neutral_internal=not args.no_mtf_neutral,
+            spread=args.spread,
+            slippage=args.slippage,
+            commission=args.commission,
         )
 
         if args.output:
