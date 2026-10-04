@@ -70,7 +70,9 @@ jobs:
           git ls-files | grep -Ei '(^|/)\.env' || echo "no .env files tracked"
           echo "credentials check done"
 
-      - name: 8. Time handling in live and paper code
+      - name: 8. Time handling in live code, and session settings
         continue-on-error: true
         run: |
-          git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime' -- 'phase_04_live/*.py' 'phase_03_paper/*.py' | head -80 || true
+          git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime|TIMEFRAME' -- phase_04_live ':!*test*' | head -120 || true
+          echo "----- phase_03_paper/config.py -----"
+          sed -n '1,170p' phase_03_paper/config.py
