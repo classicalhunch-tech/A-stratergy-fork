@@ -73,7 +73,7 @@ class LiveMarketSource(MarketDataSource):
         self.poll_interval_seconds = poll_interval_seconds
 
         self._connected = False
-        self._quality_filter = QualityFilter(on_issue=on_quality_issue)
+        self._quality_filter = QualityFilter(on_issue=on_quality_issue, reject_gaps=False)
         self._last_seen_timestamp: Optional[datetime] = None
 
     def connect(self) -> None:
