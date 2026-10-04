@@ -1,5 +1,0 @@
-[restart] safe_to_proceed=True
-[restart] kill_switch_engaged_by_this_restart=False
-[startup] symbol=XAUUSD timeframe=M5 dry_run=True
-[startup] entering candle loop...
-[risk-config] fixed_lot_size changed to 0.03
