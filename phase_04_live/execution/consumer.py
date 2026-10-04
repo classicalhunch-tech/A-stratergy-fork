@@ -15,8 +15,9 @@ This is NOT strategy logic. It is NOT execution logic. It is integration scaffol
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from phase_03_paper.signals.adapter import AdapterSignalEvent
 from phase_04_live.events.event_types import LiveEvent, LiveEventType
@@ -25,6 +26,10 @@ from phase_04_live.execution.models import ExecutionRequest, ExecutionResult
 
 
 logger = logging.getLogger(__name__)
+
+
+_LONG_WORDS = {"LONG", "BUY", "UP", "BULLISH"}
+_SHORT_WORDS = {"SHORT", "SELL", "DOWN", "BEARISH"}
 
 
 class ExecutionEventConsumer:
@@ -120,6 +125,12 @@ class ExecutionEventConsumer:
             initial_risk=float(signal_event.initial_risk),
             signal_generated_at=event.occurred_at,
             request_created_at=datetime.now(timezone.utc),
+            stop_loss=self._optional_price(
+                getattr(signal_event.signal, "stop_loss", None)
+            ),
+            take_profit=self._optional_price(
+                getattr(signal_event.signal, "take_profit", None)
+            ),
         )
         
         # ============================================================
@@ -165,28 +176,39 @@ class ExecutionEventConsumer:
         )
 
     @staticmethod
+    def _optional_price(value: Any) -> Optional[float]:
+        """Return a finite positive float, or None if missing or invalid."""
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number <= 0:
+            return None
+        return number
+
+    @staticmethod
     def _infer_order_type(signal_event: AdapterSignalEvent) -> Optional[str]:
         """
         Infer BUY/SELL from the signal's direction.
         
-        Adapter signals carry direction info; extract it here.
-        This is adapter-specific and may need to change as the adapter evolves.
+        Accepts plain strings ("LONG") and enum members whose value is a
+        string (for example SignalType.LONG).
         """
         signal = signal_event.signal
         
-        # Try to infer from signal attributes
-        if hasattr(signal, "direction"):
-            direction = getattr(signal, "direction", None)
-            if direction and direction.upper() in ("LONG", "BUY", "UP"):
+        for attribute in ("direction", "signal_type"):
+            raw = getattr(signal, attribute, None)
+            if raw is None:
+                continue
+            
+            text = str(getattr(raw, "value", raw)).strip().upper()
+            text = text.split(".")[-1]
+            
+            if text in _LONG_WORDS:
                 return "BUY"
-            elif direction and direction.upper() in ("SHORT", "SELL", "DOWN"):
-                return "SELL"
-        
-        if hasattr(signal, "signal_type"):
-            signal_type = getattr(signal, "signal_type", "").upper()
-            if "BUY" in signal_type or "LONG" in signal_type:
-                return "BUY"
-            elif "SELL" in signal_type or "SHORT" in signal_type:
+            if text in _SHORT_WORDS:
                 return "SELL"
         
         # Fallback: unable to determine
