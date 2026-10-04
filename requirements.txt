@@ -1,0 +1,5 @@
+pandas
+numpy
+pytest
+MetaTrader5; sys_platform == "win32"
+# TODO: add the dashboard server packages and pin versions after confirming they work
