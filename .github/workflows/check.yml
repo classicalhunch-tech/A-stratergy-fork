@@ -1,0 +1,57 @@
+name: check
+on:
+  push:
+    branches: [feature/multi-timeframe]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        continue-on-error: true
+        run: |
+          pip install pandas numpy pytest streamlit
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: 1. Baseline backtest (main.py)
+        continue-on-error: true
+        run: python main.py --data data/master_historical_data.csv
+
+      - name: 2. Tracked files that .gitignore would ignore
+        continue-on-error: true
+        run: git ls-files -ci --exclude-standard
+
+      - name: 3. Secrets scan (file and line only, values hidden)
+        continue-on-error: true
+        run: |
+          git grep -nEi '(password|passwd|secret|api[_-]?key|token|mt5\.login|mt5\.initialize)' -- '*.py' '*.json' '*.toml' '*.txt' '*.cfg' '*.ini' '*.md' '*.ps1' | cut -d: -f1,2 | head -100 || true
+          git ls-files | grep -Ei '(^|/)\.env' || echo "no .env files tracked"
+
+      - name: 4. Timezone handling in code
+        continue-on-error: true
+        run: |
+          git grep -nE 'tz_localize|tz_convert|timezone|utc' -- '*.py' | head -80 || true
+          git grep -n 'master_historical_data' | head -20 || true
+
+      - name: 5. Tests (excluding the look-ahead test)
+        continue-on-error: true
+        run: pytest -q -s tests --ignore=tests/test_mtf_causality.py 2>&1 | tail -80
+
+      - name: 6. Third-party imports used in the repo
+        continue-on-error: true
+        run: |
+          git grep -hE '^\s*(import|from)\s+[A-Za-z_]' -- '*.py' | sed -E 's/^\s+//' | awk '{print $2}' | cut -d. -f1 | sort | uniq -c | sort -rn | head -60
+
+      - name: 7. MTF look-ahead test
+        continue-on-error: true
+        run: python tests/test_mtf_causality.py
