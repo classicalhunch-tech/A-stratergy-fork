@@ -7,7 +7,7 @@ Pipeline
 --------
 5M OHLC
     v
-4H Macro + 15M Internal Structure (MTF context)
+1H Macro + 15M Internal Structure (MTF context)
     v
 run_backtest() [tested, validated engine]
     - Swings
@@ -58,6 +58,7 @@ from strategy.backtest import run_backtest
 from strategy.mtf_structure import build_mtf_dataset_with_structure
 from strategy.confluence import build_mtf_signal_filter
 from strategy.swings import find_swings
+from dashboard.mtf_context import MTFConfig
 
 
 # =====================================================================
@@ -65,6 +66,10 @@ from strategy.swings import find_swings
 # =====================================================================
 
 REQUIRED_OHLC_COLUMNS = {"open", "high", "low", "close"}
+
+# Multi-timeframe settings (one place to change them)
+MTF_MACRO_TF = "1h"
+MTF_INTERNAL_TF = "15min"
 
 # Errors we treat as EXPECTED pipeline conditions (bad input, bad data).
 # These get a clean one-line message because the user can act on them.
@@ -153,7 +158,7 @@ def build_mtf_context(df_5m: pd.DataFrame) -> pd.DataFrame:
     Build the lookahead-safe MTF dataset.
 
     Higher-timeframe structure:
-        4H = macro context
+        1H = macro context
         15M = internal context
 
     The actual MTF logic remains inside strategy.mtf_structure.
@@ -163,6 +168,10 @@ def build_mtf_context(df_5m: pd.DataFrame) -> pd.DataFrame:
         df_5m,
         macro_swings_fn=find_swings,
         internal_swings_fn=find_swings,
+        config=MTFConfig(
+            macro_tf=MTF_MACRO_TF,
+            internal_tf=MTF_INTERNAL_TF,
+        ),
     )
 
     print("   MTF enrichment complete.")
@@ -270,7 +279,7 @@ def main():
         print("\n1. Loading raw 5M OHLC dataset...")
         df_5m = load_5m_data(args.data)
 
-        print("\n2. Building 4H macro and 15M internal structure...")
+        print("\n2. Building 1H macro and 15M internal structure...")
         df_enriched = build_mtf_context(df_5m)
 
         print("\n3. Running MTF-gated backtest (tested engine + confluence guard)...")
