@@ -104,16 +104,21 @@ This maintains clean separation:
 The consumer is optional (can be disabled or swapped out). The runner
 applies it to every event batch after the engine runs.
 
+IMPORTANT -- SAFE DEFAULTS
+
+The runner is in DRY-RUN mode unless --live is given explicitly, and
+the executor rejects any order that has no stop loss.
+
 USAGE:
 
-    Smoke test:
+    Smoke test (dry run):
         python -m phase_04_live.main --once
 
-    Continuous loop:
+    Continuous loop (dry run, the default):
         python -m phase_04_live.main
-    
-    Dry run (no actual broker orders):
-        python -m phase_04_live.main --dry-run
+
+    Real orders (only after an order_sink is implemented and tested):
+        python -m phase_04_live.main --live
 """
 
 from __future__ import annotations
@@ -150,7 +155,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SYMBOL = "XAUUSD"
-TIMEFRAME = "M15"
+
+# Base timeframe. This must match the timeframe the strategy was built and
+# backtested on (5-minute candles). The 15m and 1h structure is derived from
+# it inside the adapter.
+TIMEFRAME = "M5"
 
 POLL_INTERVAL_SECONDS = 5.0
 
@@ -163,7 +172,7 @@ STALE_AFTER_MISSED_CANDLES = 2
 KILL_SWITCH_PATH = Path("state/kill_switch.json")
 
 # Broker execution configuration
-EXECUTOR_MAX_ORDER_SIZE = 0.1  # Max notional per order
+EXECUTOR_MAX_ORDER_SIZE = 0.1  # Max order VOLUME in lots (checked when the request carries a volume)
 EXECUTOR_ORDER_TIMEOUT_SECONDS = 30.0
 
 
@@ -303,35 +312,38 @@ def build_event_engine() -> tuple[LiveEventEngine, LiveMarketSource]:
 def build_execution_consumer(
     kill_switch: EmergencyKillSwitch,
     safe_mode_gate: SafeModeGate,
-    enable_dry_run: bool = False,
+    enable_dry_run: bool = True,
     order_sink: Optional[Callable] = None,
 ) -> ExecutionEventConsumer:
     """
     Build the execution consumer and broker executor.
-    
+
     The executor is optional and can be disabled by passing dry_run=True
     or by not providing an order_sink. In both cases, orders are logged
     but not sent to the broker.
+
+    Every order must carry a stop loss (require_stop_loss=True).
     """
-    
+
     executor_config = ExecutionConfig(
         max_order_size=EXECUTOR_MAX_ORDER_SIZE,
         order_timeout_seconds=EXECUTOR_ORDER_TIMEOUT_SECONDS,
         enable_dry_run=enable_dry_run,
+        require_stop_loss=True,
     )
-    
+
     broker_executor = BrokerExecutor(
         kill_switch=kill_switch,
         safe_mode_gate=safe_mode_gate,
         config=executor_config,
         order_sink=order_sink,
     )
-    
+
     consumer = ExecutionEventConsumer(
         broker_executor=broker_executor,
         symbol=SYMBOL,
     )
-    
+
     return consumer
 
 
@@ -361,10 +373,20 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Log orders instead of sending them to the broker.",
+        help="Log orders instead of sending them to the broker (this is already the default).",
+    )
+
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Send real orders to the broker. Without this flag the runner is always in dry-run mode.",
     )
 
     args = parser.parse_args()
+
+    # Safe by default: real orders only with an explicit --live, and
+    # --dry-run always wins if both flags are given.
+    dry_run = args.dry_run or not args.live
 
     engine, live_source = build_event_engine()
 
@@ -379,7 +401,7 @@ def main() -> int:
     execution_consumer = build_execution_consumer(
         kill_switch=kill_switch,
         safe_mode_gate=safe_mode_gate,
-        enable_dry_run=args.dry_run,
+        enable_dry_run=dry_run,
         order_sink=None,  # Implement your broker order submission here
     )
 
@@ -395,10 +417,10 @@ def main() -> int:
         if args.once:
             print(f"Running ONE live cycle for {SYMBOL} {TIMEFRAME}...")
             events = engine.run_once()
-            
+
             # Apply execution consumer to the event stream
             events = execution_consumer.consume(events)
-            
+
             print(f"Cycle complete. {len(events)} event(s) produced:")
             for event in events:
                 print(f"  {event.event_type.value} @ {event.occurred_at} -> {event.payload}")
@@ -406,18 +428,18 @@ def main() -> int:
 
         print(f"Running live loop for {SYMBOL} {TIMEFRAME} (poll every {POLL_INTERVAL_SECONDS}s).")
         print("Session decisions remain under the existing Phase 3 session gate; this runner does not auto-approve them.")
-        print(f"Execution mode: {'DRY-RUN' if args.dry_run else 'LIVE'}")
+        print(f"Execution mode: {'DRY-RUN' if dry_run else 'LIVE'}")
 
         try:
             while True:
                 events = engine.run_once()
-                
+
                 # Apply execution consumer to the event stream
                 events = execution_consumer.consume(events)
-                
+
                 for event in events:
                     print(f"{event.event_type.value} @ {event.occurred_at}")
-                
+
                 import time
                 time.sleep(engine.poll_interval_seconds)
         except KeyboardInterrupt:
