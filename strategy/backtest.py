@@ -16,6 +16,7 @@ Walks historical OHLC data bar-by-bar while enforcing:
     - actual-fill risk calculation
     - duplicate setup protection
     - OPEN trades at dataset end
+    - optional trading costs (spread, slippage, commission)
 
 Performance architecture
 ------------------------
@@ -116,6 +117,24 @@ OHLC-compatible actual fill through _gap_aware_fill() (now inside
 retest_engine.py).
 
 Initial risk is always calculated from the actual fill.
+
+Trading costs
+-------------
+
+run_backtest() accepts spread, slippage and commission, all in
+PRICE UNITS (for XAUUSD, 0.30 means 30 cents). They default to 0.0,
+which reproduces the original cost-free behavior exactly.
+
+The round-trip cost is:
+
+    spread + (2 * slippage) + commission
+
+and it is deducted from each closed trade's realized R as:
+
+    cost_r = round_trip_cost / initial_risk
+
+This changes the R of closed trades. It does not change which trades
+trigger or which levels they hit.
 """
 
 from dataclasses import dataclass, field, replace
@@ -769,9 +788,13 @@ def _close_trade(
     exit_time: pd.Timestamp,
     exit_price: float,
     result_status: str,
+    round_trip_cost: float = 0.0,
 ) -> None:
     """
     Finalize a trade after SL/TP has been reached.
+
+    round_trip_cost is in price units (spread + slippage on both
+    sides + commission) and is deducted from the realized R.
     """
 
     trade.result_status = result_status
@@ -780,13 +803,26 @@ def _close_trade(
     )
     trade.exit_time = exit_time
 
-    trade.r_multiple = (
+    gross_r = (
         _calculate_r_multiple(
             trade.direction,
             trade.fill_price,
             trade.exit_price,
             trade.initial_risk,
         )
+    )
+
+    if trade.initial_risk > EPSILON:
+        cost_r = (
+            round_trip_cost
+            / trade.initial_risk
+        )
+    else:
+        cost_r = 0.0
+
+    trade.r_multiple = (
+        gross_r
+        - cost_r
     )
 
 
@@ -801,6 +837,9 @@ def run_backtest(
     stop_buffer: float = 0.0,
     entry_mode: str = "midpoint",
     mtf_filter_fn: Optional[Callable[[TradeSignal, pd.Timestamp], bool]] = None,
+    spread: float = 0.0,
+    slippage: float = 0.0,
+    commission: float = 0.0,
 ) -> BacktestResult:
     """
     Run deterministic event-driven backtest.
@@ -827,6 +866,17 @@ def run_backtest(
         provided, a freshly discovered signal is only registered
         as pending if this returns True; otherwise it is dropped
         and counted in total_mtf_rejected.
+
+    spread:
+        Spread crossed once per round trip, in price units
+        (XAUUSD: 0.30 = 30 cents). Default 0.0.
+
+    slippage:
+        Adverse slippage per side, in price units. It is applied
+        on both entry and exit. Default 0.0.
+
+    commission:
+        Total round-trip commission, in price units. Default 0.0.
     """
 
     # ========================================================
@@ -864,6 +914,24 @@ def run_backtest(
             "entry_mode must be "
             "'midpoint' or 'extreme'"
         )
+
+    if (
+        spread < 0
+        or slippage < 0
+        or commission < 0
+    ):
+        raise ValueError(
+            "spread, slippage and commission "
+            "must be >= 0"
+        )
+
+    # Spread is crossed once per round trip, slippage hits both
+    # entry and exit. All values are in price units.
+    round_trip_cost = (
+        spread
+        + (2.0 * slippage)
+        + commission
+    )
 
     # ========================================================
     # 2. STRUCTURAL PIPELINE
@@ -1074,6 +1142,7 @@ def run_backtest(
                     exit_time=current_time,
                     exit_price=trade.stop_loss,
                     result_status="LOSS",
+                    round_trip_cost=round_trip_cost,
                 )
 
                 completed_trades.append(
@@ -1087,6 +1156,7 @@ def run_backtest(
                     exit_time=current_time,
                     exit_price=trade.take_profit,
                     result_status="WIN",
+                    round_trip_cost=round_trip_cost,
                 )
 
                 completed_trades.append(
