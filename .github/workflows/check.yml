@@ -29,6 +29,20 @@ jobs:
           grep -nE 'MTF_MACRO_TF|MTF_INTERNAL_TF' main.py || echo "main.py is the OLD version (default 4h macro)"
           python main.py --data data/master_historical_data.csv
 
+      - name: 1b. Backtest with gold-sized costs (information only)
+        continue-on-error: true
+        run: python main.py --data data/master_historical_data.csv --spread 0.30 --slippage 0.10
+
+      - name: 1c. Price range of the CSV (is it gold-sized?)
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/master_historical_data.csv", index_col=0, parse_dates=True)
+          print("close min:", float(df["close"].min()), "| close max:", float(df["close"].max()))
+          print("median 5m range:", float((df["high"] - df["low"]).median()))
+          EOF
+
       - name: 2. Tracked files that .gitignore would ignore
         continue-on-error: true
         run: git ls-files -ci --exclude-standard
@@ -70,7 +84,7 @@ jobs:
         run: |
           git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime|TIMEFRAME' -- phase_04_live ':!*test*' | head -120 || true
           echo "----- phase_03_paper/config.py -----"
-          sed -n '1,170p' phase_03_paper/config.py
+          sed -n '1,220p' phase_03_paper/config.py
 
       - name: 9. Syntax check of live code (cannot be imported on Linux)
         continue-on-error: true
