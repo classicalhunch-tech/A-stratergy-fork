@@ -25,6 +25,7 @@ a broker order, with idempotency and kill-switch protection.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
@@ -42,12 +43,22 @@ from phase_04_live.risk.kill_switch import EmergencyKillSwitch
 logger = logging.getLogger(__name__)
 
 
+def _is_positive_number(value: Any) -> bool:
+    """True only for a finite number greater than zero."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
 @dataclass
 class ExecutionConfig:
     """Configuration for the broker executor."""
-    max_order_size: float = 0.1  # Max notional per order
+    max_order_size: float = 0.1  # Max VOLUME in lots per order (only checked when the request has a volume)
     order_timeout_seconds: float = 30.0
     enable_dry_run: bool = False  # If True, no actual broker orders
+    require_stop_loss: bool = False  # If True, orders without a stop loss are rejected (the live runner should turn this on)
 
 
 class BrokerExecutor:
@@ -217,8 +228,10 @@ class BrokerExecutor:
         
         Checks:
             1. Kill switch is not engaged (fresh read, not cached)
-            2. Order size is within limits
-            3. Required fields are present and valid
+            2. Required fields are present and valid
+            3. Order volume (lots) is within limits, when a volume is given
+            4. Stop loss / take profit are on the correct side of the entry
+               (and a stop loss is present when require_stop_loss is on)
         """
         
         # --------------------------------------------------------
@@ -233,21 +246,7 @@ class BrokerExecutor:
             )
         
         # --------------------------------------------------------
-        # 2. Order size validation
-        # --------------------------------------------------------
-        
-        notional = request.entry_price * abs(request.initial_risk)
-        if notional > self._config.max_order_size:
-            return ExecutionGuardStatus(
-                allowed=False,
-                reason=(
-                    f"Order notional {notional:.2f} exceeds limit "
-                    f"{self._config.max_order_size:.2f}"
-                ),
-            )
-        
-        # --------------------------------------------------------
-        # 3. Request completeness
+        # 2. Request completeness
         # --------------------------------------------------------
         
         if not request.signal_id or not request.signal_id.strip():
@@ -268,17 +267,99 @@ class BrokerExecutor:
                 reason=f"Invalid order_type: {request.order_type}",
             )
         
-        if request.entry_price <= 0:
+        if not _is_positive_number(request.entry_price):
             return ExecutionGuardStatus(
                 allowed=False,
                 reason=f"Invalid entry_price: {request.entry_price}",
             )
         
-        if request.initial_risk <= 0:
+        if not _is_positive_number(request.initial_risk):
             return ExecutionGuardStatus(
                 allowed=False,
                 reason=f"Invalid initial_risk: {request.initial_risk}",
             )
+        
+        # --------------------------------------------------------
+        # 3. Order volume (lots)
+        # --------------------------------------------------------
+        
+        if request.volume is not None:
+            if not _is_positive_number(request.volume):
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=f"Invalid volume: {request.volume}",
+                )
+            
+            if request.volume > self._config.max_order_size:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        f"Order volume {request.volume} lots exceeds limit "
+                        f"{self._config.max_order_size} lots"
+                    ),
+                )
+        
+        # --------------------------------------------------------
+        # 4. Stop loss and take profit
+        # --------------------------------------------------------
+        
+        is_buy = request.order_type == "BUY"
+        
+        if request.stop_loss is None:
+            if self._config.require_stop_loss:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason="Missing stop_loss (required for live orders)",
+                )
+        else:
+            if not _is_positive_number(request.stop_loss):
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=f"Invalid stop_loss: {request.stop_loss}",
+                )
+            
+            if is_buy and request.stop_loss >= request.entry_price:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        f"stop_loss {request.stop_loss} must be below entry "
+                        f"{request.entry_price} for a BUY"
+                    ),
+                )
+            
+            if (not is_buy) and request.stop_loss <= request.entry_price:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        f"stop_loss {request.stop_loss} must be above entry "
+                        f"{request.entry_price} for a SELL"
+                    ),
+                )
+        
+        if request.take_profit is not None:
+            if not _is_positive_number(request.take_profit):
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=f"Invalid take_profit: {request.take_profit}",
+                )
+            
+            if is_buy and request.take_profit <= request.entry_price:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        f"take_profit {request.take_profit} must be above entry "
+                        f"{request.entry_price} for a BUY"
+                    ),
+                )
+            
+            if (not is_buy) and request.take_profit >= request.entry_price:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        f"take_profit {request.take_profit} must be below entry "
+                        f"{request.entry_price} for a SELL"
+                    ),
+                )
         
         return ExecutionGuardStatus(allowed=True, reason=None)
 
