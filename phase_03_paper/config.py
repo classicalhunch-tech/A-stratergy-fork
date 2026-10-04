@@ -63,7 +63,8 @@ class GeneralSettings:
 class MarketDataSettings:
     """Market-data and candle-validation settings."""
 
-    symbol: str = "EURUSD"
+    # Must match SYMBOL in phase_04_live/main.py.
+    symbol: str = "XAUUSD"
     timeframe: str = "M5"
 
     # Phase 3 starts with a synthetic/demo source.
@@ -165,7 +166,9 @@ class PaperExecutionSettings:
     starting_balance: float = 10_000.0
 
     # Simulated spread expressed in the instrument's price units.
-    simulated_spread: float = 0.0002
+    # XAUUSD: 0.30 = 30 cents. Replace with your broker's real
+    # typical spread once measured in MT5 (keep it pessimistic).
+    simulated_spread: float = 0.30
 
     # Supported models:
     #   none
@@ -174,7 +177,8 @@ class PaperExecutionSettings:
     slippage_model: str = "fixed"
 
     # Maximum/fixed simulated adverse movement in price units.
-    slippage_fixed_amount: float = 0.0001
+    # XAUUSD: 0.10 = 10 cents. Placeholder until measured on real fills.
+    slippage_fixed_amount: float = 0.10
 
     # Supported models:
     #   none
