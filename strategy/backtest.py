@@ -17,6 +17,7 @@ Walks historical OHLC data bar-by-bar while enforcing:
     - duplicate setup protection
     - OPEN trades at dataset end
     - optional trading costs (spread, slippage, commission)
+    - optional strict entry fill (limit-order realism)
 
 Performance architecture
 ------------------------
@@ -135,6 +136,20 @@ and it is deducted from each closed trade's realized R as:
 
 This changes the R of closed trades. It does not change which trades
 trigger or which levels they hit.
+
+Entry fill mode
+---------------
+
+run_backtest() also accepts strict_entry_fill (default False).
+
+    False -- original rule: a setup triggers as soon as price touches
+             the zone edge (LONG: zone top, SHORT: zone bottom).
+    True  -- limit-order realism: a setup only triggers once price
+             actually trades through the signal's entry price.
+
+The flag is forwarded to strategy/retest_engine.advance_pending_signal.
+When False, behavior is identical to every prior version. When True,
+fewer setups trigger because the zone-edge touch is no longer enough.
 """
 
 from dataclasses import dataclass, field, replace
@@ -840,6 +855,7 @@ def run_backtest(
     spread: float = 0.0,
     slippage: float = 0.0,
     commission: float = 0.0,
+    strict_entry_fill: bool = False,
 ) -> BacktestResult:
     """
     Run deterministic event-driven backtest.
@@ -877,6 +893,11 @@ def run_backtest(
 
     commission:
         Total round-trip commission, in price units. Default 0.0.
+
+    strict_entry_fill:
+        False (default) keeps the original trigger rule (zone edge).
+        True requires price to trade through the entry price before a
+        setup fills (limit-order realism). See retest_engine.py.
     """
 
     # ========================================================
@@ -1205,6 +1226,7 @@ def run_backtest(
                 current_low=current_low,
                 visible_zones=current_visible_zones,
                 max_bars_to_retest=max_bars_to_retest,
+                strict_entry_fill=strict_entry_fill,
             )
 
             if (
