@@ -32,6 +32,12 @@ thresholds, ordering, or the EPSILON tolerance has been altered.
 Only the surrounding bookkeeping (which list a signal lands in,
 which counter increments) has moved to the caller, via the returned
 PendingOutcome.
+
+The single addition is the optional strict_entry_fill flag. It
+defaults to False, which keeps the original behaviour exactly. When
+True, a setup only triggers if price actually trades through the
+signal's entry price (limit-order realism), instead of triggering as
+soon as price touches the zone edge.
 """
 
 from dataclasses import dataclass
@@ -149,6 +155,7 @@ def advance_pending_signal(
     current_low: float,
     visible_zones: List[Zone],
     max_bars_to_retest: int,
+    strict_entry_fill: bool = False,
 ) -> PendingOutcome:
     """
     Advance one PENDING_RETEST signal by exactly one bar.
@@ -158,6 +165,14 @@ def advance_pending_signal(
     as the original inline backtest.py loop did. The caller is
     responsible for counters and list membership based on the
     returned PendingOutcome.outcome.
+
+    strict_entry_fill:
+        False (default) -- original behaviour: the signal triggers when
+        price touches the zone edge (LONG: zone top, SHORT: zone
+        bottom), and the fill is recorded at the entry price.
+        True -- limit-order realism: the signal triggers only if price
+        actually trades through the entry price (LONG: low <= entry,
+        SHORT: high >= entry). The fill stays gap-aware.
     """
 
     bars_elapsed = current_index - setup_idx
@@ -257,7 +272,17 @@ def advance_pending_signal(
     # AUTHORITATIVE RETEST
     # ------------------------------------------------
 
-    if signal.signal_type == SignalType.LONG:
+    if strict_entry_fill:
+        # Limit-order realism: the setup only fills if price actually
+        # trades through the entry price, not merely the zone edge.
+        planned_limit = float(signal.entry_price)
+
+        if signal.signal_type == SignalType.LONG:
+            entry_touched = current_low <= planned_limit + EPSILON
+        else:
+            entry_touched = current_high >= planned_limit - EPSILON
+
+    elif signal.signal_type == SignalType.LONG:
         entry_touched = _long_retest_touched(current_low, zone_top)
     else:
         entry_touched = _short_retest_touched(current_high, zone_bottom)
