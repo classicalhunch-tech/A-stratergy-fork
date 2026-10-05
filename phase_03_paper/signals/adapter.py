@@ -26,73 +26,24 @@ The adapter is responsible only for:
 - returning newly TRIGGERED signals to Phase 3
 - reporting adapter-level errors
 
-Architecture:
-
-    MarketDataEngine
-           |
-           v
-    StrategyAdapter
-           |
-           v
-    Existing strategy/
-           |
-           v
-    PENDING_RETEST
-           |
-           v
-    retest_engine.py
-           |
-           v
-    TRIGGERED SIGNAL
-           |
-           v
-    PaperTradeEngine
-
-
 DESIGN NOTES
 ------------
 
-1. The adapter currently reuses several private helpers from
-   strategy.backtest:
-
+1. The adapter reuses several private helpers from strategy.backtest:
        _prepare_full_context
        _visible_zones
        _visible_liquidity_levels
        _current_structure_breaks
        _make_setup_key
 
-   This is intentional for the first correctness-focused implementation.
+2. Swing detection, structure, zones, and liquidity are incremental.
 
-   A future strategy refactor may extract these helpers into a shared
-   public strategy context module. That refactor should NOT be performed
-   silently as part of Phase 3.
+3. Pending signals, consumed zones, registered setup keys, and
+   liquidity levels persist across candles.
 
-2. Swing detection is incremental (see SWING STATE PERFORMANCE NOTE
-   below). Zone creation is incremental (see ZONE STATE PERFORMANCE
-   NOTE below). Structure is now ALSO incremental (see STRUCTURE
-   STATE PERFORMANCE NOTE below).
+4. The prepared signal context is persistent.
 
-3. Liquidity level creation is incremental.
-
-   The adapter persists liquidity levels across candles and only creates
-   levels for swings that have not previously been processed.
-
-   This prevents previously-resolved liquidity levels from being recreated
-   as ACTIVE on every candle.
-
-   update_liquidity_sweeps() still receives the complete causal DataFrame,
-   but its existing ACTIVE-only filter can now persistently skip liquidity
-   levels that have already been resolved.
-
-4. Pending signals, consumed zones, registered setup keys, and liquidity
-   levels persist across candles because Phase 3 is a long-running process.
-
-5. The prepared signal context is also persistent.
-
-   _prepare_full_context() runs once and the existing context is then
-   extended one candle at a time.
-
-6. The adapter does NOT:
+5. The adapter does NOT:
    - execute orders
    - simulate fills
    - manage open positions
@@ -102,187 +53,15 @@ DESIGN NOTES
    - generate notifications
    - perform journal/persistence work
 
-7. The caller is responsible for checking whether trading is permitted
-   before asking the adapter to process a candle.
-
-NOTE ON ZONE MITIGATION:
-   update_mitigation() from strategy.zones is NOT currently called
-   anywhere in this adapter. find_zones()/compute_zone_for_break()
-   both create Zone objects with mitigated=False, and nothing here
-   flips that flag as candles arrive. strategy.signals and
-   strategy.retest_engine both actively check zone.mitigated to
-   exclude already-mitigated zones from new signals and retests, so
-   this is a known, currently-unaddressed gap between this adapter
-   and strategy.backtest.run_backtest() (which replays mitigation
-   chronologically before its main loop). Spot-checked against
-   run_backtest() on 1,000 and 2,000-candle real datasets with no
-   observed divergence (see check_adapter_vs_backtest.py), but this
-   has not been proven absent in general and should be revisited.
-
-
-PERFORMANCE NOTE (liquidity)
-----------------------------
-
-The original adapter recreated liquidity levels from the complete swing
-history on every candle.
-
-Because detect_liquidity_levels() creates fresh LiquidityLevel objects,
-this reset previously-resolved levels back to ACTIVE and caused
-update_liquidity_sweeps() to repeatedly reconsider old liquidity levels.
-
-The adapter now persists:
-
-    self._liquidity_levels
-    self._processed_swing_keys
-
-Only newly observed swings are passed to
-detect_liquidity_levels().
-
-This is an adapter-level state-management optimization.
-
-It does NOT modify the Phase 1 strategy rules.
-
-This optimization must be validated by:
-
-1. strategy unit tests
-2. full Phase 3 test suite
-3. benchmark comparison
-4. output comparison against the pre-optimization implementation
-
-The output comparison should include:
-
-- structure breaks
-- zones
-- liquidity levels
-- liquidity sweep status
-- signal status
-- triggered signals
-- setup keys
-- trade events
-
-The optimization must not introduce:
-
-- look-ahead
-- duplicate liquidity levels
-- duplicate signals
-- earlier signals
-- missing signals
-- changed signal timing
-- changed trade events
-
-
-SWING STATE PERFORMANCE NOTE
------------------------------
-
-Profiling showed find_swings(df) -- re-run on the complete causal
-DataFrame on every single candle -- was the single largest cost in
-_build_strategy_context(), and the main driver of the adapter's
-observed O(n^2)-like scaling (500 candles ~11s, 1,000 ~40s,
-2,000 ~174s in early measurements).
-
-strategy/swings.py now also exposes SwingState: an incremental,
-causal swing detector whose step() method is proven -- not assumed
--- exactly equivalent to find_swings() when fed rows one at a time,
-in order. That proof lives in
-phase_02_optimization/test_swing_state_equivalence.py (500 / 1,000 /
-2,000 / 5,000-candle synthetic datasets, 4 extra random seeds, and
-the real historical dataset -- all passing, identical swing counts
-and values both ways).
-
-find_swings(df) itself is UNCHANGED and remains the correctness
-reference. This adapter no longer calls it directly; instead it
-creates exactly ONE SwingState for its entire lifetime
-(self._swing_state, set in __init__) and feeds each new row to it via
-step() exactly once, via _advance_swing_state(). This turns the
-swing-detection cost from O(n) work repeated n times into O(n) work
-done once across the adapter's lifetime.
-
-Do NOT create more than one SwingState per adapter instance, and do
-NOT feed any row to step() more than once -- both would silently
-break the equivalence guarantee this optimization depends on.
-
-
-ZONE STATE PERFORMANCE NOTE
------------------------------
-
-After the SwingState optimization, profiling showed find_zones(df,
-all_structure_breaks) -- re-run on the complete causal history and
-complete break list on every single candle -- became the new
-dominant cost (e.g. ~52s of a ~84s total through 2,000 candles),
-with the same O(n) per-call / O(n^2) overall shape find_swings()
-used to have.
-
-strategy/zones.py now also exposes compute_zone_for_break(): an
-incremental zone builder that computes the zone for exactly one
-structure break, given its already-known positional index, instead
-of rebuilding an index_pos lookup and re-looping over every break on
-every candle. A zone's origin cluster and boundaries are fixed the
-moment its break occurs (the underlying walk is strictly backward),
-so this is proven -- not assumed -- exactly equivalent to find_zones()
-by phase_02_optimization/test_zone_equivalence.py (500 / 1,000 /
-2,000 / 5,000-candle real datasets, 4 synthetic seeds -- all passing,
-identical zone counts and values both ways).
-
-find_zones(df, breaks) itself is UNCHANGED and remains the
-correctness reference. This adapter no longer calls it directly;
-instead it persists self._zones across its entire lifetime and
-converts each new structure break into a zone exactly once, via
-_advance_zone_state(), tracked by self._processed_break_keys.
-
-Do NOT feed any structure break to compute_zone_for_break() more
-than once -- that would silently duplicate zones and break the
-equivalence guarantee this optimization depends on.
-
-
-STRUCTURE STATE PERFORMANCE NOTE
------------------------------
-
-After the SwingState and ZoneState optimizations, profiling and
-direct timing (time_new_adapter_scaling.py) showed the adapter still
-scaled worse than linearly (500 candles ~3.3s, 1,000 ~9.1s, 2,000
-~27.6s, 5,000 ~269.9s), with analyze_structure(df, all_swings) --
-still called on the complete causal DataFrame and complete swing
-list on every single candle -- as the confirmed remaining cost (see
-the compare_old_vs_new.py traceback into
-strategy/zones.py:_find_origin_cluster, which was actually inside
-this same full-history-recompute call chain).
-
-strategy/structure.py now also exposes StructureState: an
-incremental, causal structure tracker whose step() method is proven
--- not assumed -- exactly equivalent to analyze_structure() when fed
-rows (and their newly available swings) one at a time, in order.
-That proof lives in
-phase_02_optimization/test_structure_state_equivalence.py (500 /
-1,000 / 2,000 / 5,000-candle real MT5 dataset checks, all passing,
-identical breaks / classified_swings / final trend both ways).
-
-analyze_structure(df, swings) itself is UNCHANGED and remains the
-correctness reference. This adapter no longer calls it directly;
-instead it creates exactly ONE StructureState for its entire
-lifetime (self._structure_state, set in __init__) and feeds each new
-row to it via step() exactly once, via _advance_structure_state(),
-interleaved with newly confirmed swings via add_swings() in the same
-order analyze_structure()'s own unlock loop would see them.
-
-Do NOT create more than one StructureState per adapter instance, do
-NOT feed any row to step() more than once, and do NOT feed any swing
-to add_swings() more than once -- all three would silently break the
-equivalence guarantee this optimization depends on.
-
 ENTRY FILL MODE
 ---------------
 
-The adapter also accepts strict_entry_fill (default False), which is
-forwarded verbatim to strategy/retest_engine.advance_pending_signal.
+The adapter accepts strict_entry_fill (default False), forwarded
+verbatim to strategy/retest_engine.advance_pending_signal.
 
-    False -- original rule: a setup triggers as soon as price touches
-             the zone edge (LONG: zone top, SHORT: zone bottom).
-    True  -- limit-order realism: a setup only triggers once price
-             actually trades through the signal's entry price.
-
-The default keeps paper-trading behavior identical to every prior
-version of this adapter. Setting True makes live paper-trading fills
-match a real limit-order fill model.
+    False -- original rule: triggers on zone-edge touch.
+    True  -- limit-order realism: triggers only when price trades
+             through the signal's entry price.
 """
 
 
@@ -331,10 +110,6 @@ class AdapterSignalEvent:
     """
     Phase 3 event emitted when an existing strategy signal
     becomes TRIGGERED on the current candle.
-
-    This is an integration object only.
-
-    PaperTradeEngine is responsible for execution behavior.
     """
 
     signal: TradeSignal
@@ -396,26 +171,6 @@ class StrategyAdapter:
         self._warmup_bars = warmup_bars
         self._strict_entry_fill = bool(strict_entry_fill)
 
-        # --------------------------------------------------------
-        # MTF (1H + 15M) confluence gate
-        # --------------------------------------------------------
-        #
-        # Uses the same validated strategy/confluence.py +
-        # strategy/mtf_structure.py pipeline confirmed today against
-        # the 90,000-candle backtest (1H macro + 15M internal, hard
-        # gate: soft_internal_conflict=False). Correctness-first: the
-        # adapter only receives one new candle every 5 real minutes,
-        # so a full (non-incremental) MTF context rebuild every tick
-        # is well within that budget -- no SwingState/StructureState-
-        # style incremental machinery is needed here.
-        #
-        # FAIL-CLOSED: if MTF context building raises on a given
-        # tick, no new signals are registered that tick (existing
-        # pending signals still advance normally). This matches the
-        # rest of Phase 3's safety-first design rather than silently
-        # falling back to an ungated, unvalidated signal path.
-        # --------------------------------------------------------
-
         self._mtf_enabled = mtf_enabled
         self._mtf_macro_tf = mtf_macro_tf
         self._mtf_internal_tf = mtf_internal_tf
@@ -424,33 +179,9 @@ class StrategyAdapter:
         self._mtf_filter_fn = None
         self._mtf_df = None
 
-        # --------------------------------------------------------
-        # Causal candle history
-        # --------------------------------------------------------
-
         self._rows: List[dict] = []
 
-        # --------------------------------------------------------
-        # Cached signal-context state
-        # --------------------------------------------------------
-        #
-        # _prepare_full_context() performs preparation work that
-        # does not need to be repeated for rows already processed.
-        #
-        # The context is prepared once and then extended
-        # chronologically as new candles arrive.
-        #
-        # This does not change the structural strategy pipeline.
-        # Swings, zones, and structure are all incremental -- see
-        # SWING STATE, ZONE STATE, and STRUCTURE STATE PERFORMANCE
-        # NOTEs above.
-        # --------------------------------------------------------
-
         self._prepared_context = None
-
-        # --------------------------------------------------------
-        # Persistent cross-candle strategy state
-        # --------------------------------------------------------
 
         self._pending_signals: List[
             Tuple[TradeSignal, int]
@@ -460,83 +191,23 @@ class StrategyAdapter:
 
         self._consumed_zones: Set = set()
 
-        # --------------------------------------------------------
-        # Persistent liquidity state
-        # --------------------------------------------------------
-        #
-        # Liquidity levels are created only once for each newly
-        # observed swing and then persist across candles.
-        # --------------------------------------------------------
-
         self._liquidity_levels: List[LiquidityLevel] = []
 
         self._processed_swing_keys: Set[tuple] = set()
 
-        # --------------------------------------------------------
-        # Persistent incremental swing state
-        # --------------------------------------------------------
-        #
-        # SwingState.step() is proven exactly equivalent to calling
-        # find_swings() on the complete causal DataFrame -- see
-        # phase_02_optimization/test_swing_state_equivalence.py
-        # (500/1,000/2,000/5,000-candle synthetic + real-dataset
-        # checks, all passing). One SwingState is created here, for
-        # the adapter's entire lifetime, and every row is fed to it
-        # via step() EXACTLY ONCE, in causal order -- never more than
-        # once, and never out of order -- which is the condition the
-        # equivalence proof depends on. Do not create a second
-        # SwingState or re-feed any row.
-        # --------------------------------------------------------
-
         self._swing_state = SwingState()
 
-        # find_swings is imported lazily here (not at module top) to
-        # avoid a second import line churn in the patch; it is the
-        # exact same function strategy/mtf_structure.py's callers use
-        # for macro/internal swing detection today.
         from strategy.swings import find_swings as _mtf_swings_fn
         self._mtf_swings_fn = _mtf_swings_fn
         self._confirmed_swings: List = []
         self._swing_rows_processed = 0
 
-        # --------------------------------------------------------
-        # Persistent incremental structure state
-        # --------------------------------------------------------
-        #
-        # StructureState.step() is proven exactly equivalent to
-        # calling analyze_structure() on the complete causal
-        # DataFrame -- see
-        # phase_02_optimization/test_structure_state_equivalence.py
-        # (500/1,000/2,000/5,000-candle real-dataset checks, all
-        # passing). Do not create a second StructureState, feed any
-        # row to step() more than once, or feed any swing to
-        # add_swings() more than once.
-        # --------------------------------------------------------
-
         self._structure_state = StructureState()
         self._structure_rows_processed = 0
         self._structure_swings_fed = 0
 
-        # --------------------------------------------------------
-        # Persistent incremental zone state
-        # --------------------------------------------------------
-        #
-        # compute_zone_for_break() is proven exactly equivalent to
-        # find_zones() -- see
-        # phase_02_optimization/test_zone_equivalence.py. A zone's
-        # origin cluster and boundaries are fixed the moment its
-        # break occurs, so each break is converted into a zone
-        # exactly once and the resulting Zone list persists across
-        # candles instead of being rebuilt from the complete causal
-        # history every time.
-        # --------------------------------------------------------
-
         self._zones: List[Zone] = []
         self._processed_break_keys: Set[tuple] = set()
-
-        # --------------------------------------------------------
-        # Adapter diagnostics
-        # --------------------------------------------------------
 
         self._errors: List[str] = []
 
@@ -551,30 +222,16 @@ class StrategyAdapter:
         """
         Process exactly one new candle.
 
-        Returns:
-            A list of signals that became TRIGGERED on this candle.
-
-        Normally this list is empty.
-
-        Expired and invalidated pending signals are removed from
-        adapter state. Detailed audit/journal handling belongs to
-        the appropriate Phase 3 reporting layer.
+        Returns a list of signals that became TRIGGERED on this
+        candle. Normally empty.
         """
 
         self._append_candle(candle)
 
         current_index = len(self._rows) - 1
 
-        # --------------------------------------------------------
-        # Warmup
-        # --------------------------------------------------------
-
         if current_index < self._warmup_bars:
             return []
-
-        # --------------------------------------------------------
-        # Build causal DataFrame
-        # --------------------------------------------------------
 
         df = self._build_dataframe()
 
@@ -594,25 +251,8 @@ class StrategyAdapter:
             df.iloc[current_index]["low"]
         )
 
-        # --------------------------------------------------------
-        # Refresh the MTF confluence filter for this tick.
-        #
-        # FAIL-CLOSED: on any exception, self._mtf_filter_fn is set
-        # to a function that rejects everything, so no new signals
-        # are registered this tick until MTF context succeeds again.
-        # Existing pending signals are unaffected -- they continue
-        # to advance through the normal retest state machine.
-        # --------------------------------------------------------
-
-        # Lazy MTF: the filter is built only if a signal needs it this
-        # tick (see _get_mtf_filter). Same causal DataFrame, same result
-        # as eager building, without rebuilding on every candle.
         self._mtf_df = df
         self._mtf_filter_fn = None
-
-        # --------------------------------------------------------
-        # Existing strategy pipeline
-        # --------------------------------------------------------
 
         try:
             (
@@ -637,10 +277,6 @@ class StrategyAdapter:
 
         triggered_events: List[AdapterSignalEvent] = []
 
-        # --------------------------------------------------------
-        # 1. Advance existing pending signals
-        # --------------------------------------------------------
-
         self._advance_pending_signals(
             current_index=current_index,
             current_time=current_time,
@@ -650,10 +286,6 @@ class StrategyAdapter:
             visible_zones=current_visible_zones,
             triggered_events=triggered_events,
         )
-
-        # --------------------------------------------------------
-        # 2. Discover new signals born on this exact candle
-        # --------------------------------------------------------
 
         self._discover_new_signals(
             current_index=current_index,
@@ -696,16 +328,11 @@ class StrategyAdapter:
         return df
 
     # ============================================================
-    # LIQUIDITY STATE
+    # STABLE KEYS
     # ============================================================
 
     @staticmethod
     def _make_swing_key(swing) -> tuple:
-        """
-        Return the stable identity used to determine whether a swing
-        has already been converted into a liquidity level.
-        """
-
         return (
             swing.swing_type,
             swing.price,
@@ -715,11 +342,6 @@ class StrategyAdapter:
 
     @staticmethod
     def _make_break_key(brk) -> tuple:
-        """
-        Return the stable identity used to determine whether a
-        structure break has already been converted into a zone.
-        """
-
         return (
             brk.break_type,
             brk.direction,
@@ -732,24 +354,6 @@ class StrategyAdapter:
     # ============================================================
 
     def _advance_swing_state(self, df: pd.DataFrame) -> List:
-        """
-        Feed any rows not yet seen by self._swing_state into it via
-        step(), in causal order, appending any newly confirmed swings
-        to self._confirmed_swings.
-
-        Replaces the previous find_swings(df) call, which re-derived
-        every swing from the complete causal history on every single
-        candle (the dominant cost identified by profiling). This does
-        the equivalent O(n) work exactly once per row across the
-        adapter's lifetime instead of O(n^2) overall -- proven
-        equivalent to find_swings(df) by
-        phase_02_optimization/test_swing_state_equivalence.py.
-
-        self._swing_rows_processed is the only thing preventing a row
-        from being fed twice (which would break the equivalence proof,
-        since SwingState.step() is only proven correct when each row
-        is seen exactly once, in order).
-        """
 
         total_rows = len(df)
 
@@ -778,35 +382,6 @@ class StrategyAdapter:
     # ============================================================
 
     def _advance_structure_state(self, df: pd.DataFrame):
-        """
-        Feed any rows not yet seen by self._structure_state into it,
-        interleaved with the swings that become available at each
-        row -- exactly matching analyze_structure()'s own unlock
-        loop (swings with confirmed_at <= ts are unlocked before
-        that row's break is evaluated).
-
-        Replaces the previous analyze_structure(df, all_swings) call,
-        which re-derived the complete structure from the full causal
-        history on every single candle -- the dominant remaining cost
-        after the SwingState and ZoneState optimizations. Proven
-        equivalent to analyze_structure() by
-        phase_02_optimization/test_structure_state_equivalence.py.
-
-        Relies on self._confirmed_swings already being fully up to
-        date for this call (this must run AFTER
-        self._advance_swing_state(df) in the same
-        _build_strategy_context() call). self._structure_swings_fed
-        tracks how many of those swings have already been added to
-        self._structure_state, so each swing is added exactly once,
-        in confirmed_at order -- self._confirmed_swings is guaranteed
-        non-decreasing in confirmed_at because SwingState.step() is
-        fed rows in strict causal order.
-
-        self._structure_rows_processed is the only thing preventing
-        a row from being fed to step() twice (which would break the
-        equivalence guarantee, same as the swing/zone state notes
-        above).
-        """
 
         total_rows = len(df)
 
@@ -844,21 +419,6 @@ class StrategyAdapter:
         df: pd.DataFrame,
         all_structure_breaks,
     ) -> List:
-        """
-        Convert any not-yet-processed structure breaks into zones
-        via compute_zone_for_break(), persisting the growing zone
-        list across candles.
-
-        Replaces the previous find_zones(df, all_structure_breaks)
-        call, which re-derived every zone from the complete break
-        history on every single candle -- the dominant cost
-        identified by profiling after the SwingState optimization.
-        Proven equivalent to find_zones() by
-        phase_02_optimization/test_zone_equivalence.py.
-
-        self._processed_break_keys is the only thing preventing a
-        break from being converted into a zone more than once.
-        """
 
         for brk in all_structure_breaks:
             key = self._make_break_key(brk)
@@ -885,11 +445,6 @@ class StrategyAdapter:
         self,
         df: pd.DataFrame,
     ):
-        """
-        Run the existing Phase 1 structural pipeline.
-
-        No strategy logic is implemented here.
-        """
 
         all_swings = self._advance_swing_state(df)
 
@@ -899,17 +454,6 @@ class StrategyAdapter:
             df,
             all_structure_breaks,
         )
-
-        # --------------------------------------------------------
-        # Incremental liquidity levels
-        # --------------------------------------------------------
-        #
-        # detect_liquidity_levels() receives only swings that have
-        # not previously been converted into liquidity levels.
-        #
-        # Existing liquidity objects remain persistent so their
-        # ACTIVE/SWEPT state is not reset on every candle.
-        # --------------------------------------------------------
 
         new_swings = []
 
@@ -932,35 +476,12 @@ class StrategyAdapter:
                     self._make_swing_key(swing)
                 )
 
-        # --------------------------------------------------------
-        # Update existing ACTIVE liquidity levels.
-        #
-        # update_liquidity_sweeps() already skips levels whose
-        # status is no longer ACTIVE.
-        # --------------------------------------------------------
-
         self._liquidity_levels = update_liquidity_sweeps(
             df,
             self._liquidity_levels,
         )
 
         all_liquidity_levels = self._liquidity_levels
-
-        # --------------------------------------------------------
-        # Prepared signal context
-        # --------------------------------------------------------
-        #
-        # First strategy-processing candle:
-        #     Prepare the complete signal context.
-        #
-        # Later candles:
-        #     Extend the existing context with exactly one new
-        #     causal candle.
-        #
-        # Persistent state already stored inside the context,
-        # including bar_index_cache and consumed_zones, remains
-        # attached to the same context object.
-        # --------------------------------------------------------
 
         if self._prepared_context is None:
             signal_context = _prepare_full_context(df)
@@ -984,28 +505,11 @@ class StrategyAdapter:
         context: dict,
         new_row: dict,
     ) -> dict:
-        """
-        Extend the prepared signal context by one causal candle.
-
-        This avoids repeating full-context preparation for rows
-        that have already been processed.
-
-        Strategy logic is intentionally unchanged.
-        """
 
         working = context["working"]
         timestamp_column = context["timestamp_column"]
 
-        # --------------------------------------------------------
-        # Normalize timestamp consistently with the existing
-        # signal preparation pipeline.
-        # --------------------------------------------------------
-
         timestamp = pd.Timestamp(new_row["timestamp"])
-
-        # --------------------------------------------------------
-        # Append exactly one new row.
-        # --------------------------------------------------------
 
         new_index = len(working)
 
@@ -1017,19 +521,10 @@ class StrategyAdapter:
             "close": float(new_row["close"]),
         }
 
-        # --------------------------------------------------------
-        # Extend timestamp lookup without replacing existing
-        # entries for duplicate timestamps.
-        # --------------------------------------------------------
-
         context["timestamp_lookup"].setdefault(
             timestamp,
             new_index,
         )
-
-        # --------------------------------------------------------
-        # Refresh arrays consumed by the signal engine.
-        # --------------------------------------------------------
 
         context["highs"] = working["high"].to_numpy()
         context["lows"] = working["low"].to_numpy()
@@ -1055,10 +550,6 @@ class StrategyAdapter:
         visible_zones,
         triggered_events: List[AdapterSignalEvent],
     ) -> None:
-        """
-        Advance every pending signal through the shared
-        retest state machine.
-        """
 
         still_pending: List[
             Tuple[TradeSignal, int]
@@ -1108,8 +599,194 @@ class StrategyAdapter:
                         signal=signal,
                         setup_bar_index=setup_index,
                         trigger_bar_index=current_index,
-                        fill_price=float(
-                            outcome.fill_price
-                        ),
-                        initial_risk=float(
-                            outcome.initial
+                        fill_price=float(outcome.fill_price),
+                        initial_risk=float(outcome.initial_risk),
+                    )
+                )
+
+        self._pending_signals = still_pending
+
+    # ============================================================
+    # NEW SIGNAL DISCOVERY
+    # ============================================================
+
+    def _discover_new_signals(
+        self,
+        *,
+        current_index: int,
+        current_time: pd.Timestamp,
+        structure_breaks,
+        visible_zones,
+        liquidity_levels,
+        signal_context,
+        triggered_events: List[AdapterSignalEvent],
+    ) -> None:
+
+        try:
+            current_structure_breaks = (
+                _current_structure_breaks(
+                    structure_breaks,
+                    current_time,
+                )
+            )
+
+            if not current_structure_breaks:
+                return
+
+            visible_liquidity_levels = (
+                _visible_liquidity_levels(
+                    liquidity_levels,
+                    current_time,
+                )
+            )
+
+            if not visible_liquidity_levels:
+                return
+
+            signals = generate_flip_zone_signals(
+                liquidity_levels=visible_liquidity_levels,
+                structure_breaks=current_structure_breaks,
+                zones=visible_zones,
+                max_bars_after_sweep=self._max_bars_after_sweep,
+                max_bars_from_break=self._max_bars_from_break,
+                max_bars_to_retest=self._max_bars_to_retest,
+                reward_multiple=self._reward_multiple,
+                stop_buffer=self._stop_buffer,
+                entry_mode=self._entry_mode,
+                precomputed_context=signal_context,
+                upto_index=current_index,
+                run_retest_simulation=False,
+                consumed_zones=self._consumed_zones,
+            )
+
+            if not signals:
+                return
+
+            for signal in signals:
+                self._register_signal_if_valid(
+                    signal=signal,
+                    current_index=current_index,
+                    current_time=current_time,
+                )
+
+        except Exception as exc:
+            self._record_error(
+                current_index,
+                "signal discovery",
+                exc,
+            )
+
+    def _register_signal_if_valid(
+        self,
+        *,
+        signal: TradeSignal,
+        current_index: int,
+        current_time: pd.Timestamp,
+    ) -> None:
+
+        break_index = getattr(signal, "bar_index", None)
+        setup_index = getattr(signal, "setup_bar_index", None)
+
+        if break_index is None or setup_index is None:
+            return
+
+        try:
+            break_index = int(break_index)
+            setup_index = int(setup_index)
+        except (TypeError, ValueError):
+            return
+
+        if setup_index > current_index:
+            return
+
+        if break_index > current_index:
+            return
+
+        if break_index <= setup_index:
+            return
+
+        if signal.status != SignalStatus.PENDING_RETEST:
+            return
+
+        if break_index != current_index:
+            return
+
+        signal_key = _make_setup_key(signal, break_index)
+
+        if signal_key in self._registered_setup_keys:
+            return
+
+        if self._mtf_enabled:
+            mtf_filter = self._get_mtf_filter(current_index)
+            if not mtf_filter(signal, current_time):
+                return
+
+        self._registered_setup_keys.add(signal_key)
+
+        self._pending_signals.append(
+            (signal, break_index)
+        )
+
+    # ============================================================
+    # MTF FILTER
+    # ============================================================
+
+    def _get_mtf_filter(self, current_index: int):
+        """Build (once per tick, on demand) the MTF confluence filter."""
+
+        if self._mtf_filter_fn is not None:
+            return self._mtf_filter_fn
+
+        df = self._mtf_df
+
+        if df is None or len(df) < self._mtf_min_bars:
+            self._mtf_filter_fn = lambda signal, ts: False
+            return self._mtf_filter_fn
+
+        try:
+            df_enriched = build_mtf_dataset_with_structure(
+                df,
+                macro_swings_fn=self._mtf_swings_fn,
+                internal_swings_fn=self._mtf_swings_fn,
+                config=MTFConfig(
+                    macro_tf=self._mtf_macro_tf,
+                    internal_tf=self._mtf_internal_tf,
+                ),
+            )
+            self._mtf_filter_fn = build_mtf_signal_filter(
+                df_enriched,
+                soft_internal_conflict=self._mtf_soft_internal_conflict,
+            )
+        except Exception as exc:
+            self._record_error(current_index, "mtf context", exc)
+            self._mtf_filter_fn = lambda signal, ts: False
+
+        return self._mtf_filter_fn
+
+    # ============================================================
+    # DIAGNOSTICS
+    # ============================================================
+
+    def _record_error(
+        self,
+        current_index: int,
+        stage: str,
+        exc: Exception,
+    ) -> None:
+
+        self._errors.append(
+            f"{current_index}: {stage} error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    @property
+    def errors(self) -> List[str]:
+        return list(self._errors)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending_signals)
+
+    @property
+    def candle_count(self) -> int:
+        return len(self._rows)
