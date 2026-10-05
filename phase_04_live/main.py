@@ -104,6 +104,19 @@ This maintains clean separation:
 The consumer is optional (can be disabled or swapped out). The runner
 applies it to every event batch after the engine runs.
 
+IMPORTANT -- DAILY LOSS LIMIT
+
+The executor also checks a DailyLossLimit before every order. The
+limit compares current MT5 account equity with the first equity
+reading of the day (recorded at startup, below, and persisted in
+state/daily_loss.json so a restart cannot reset it). When the loss
+reaches DAILY_LOSS_LIMIT_PERCENT of that baseline, the kill switch is
+engaged and stays engaged until a human resets it with a reason.
+
+If equity cannot be read, the order is rejected (fail closed).
+DAILY_LOSS_LIMIT_PERCENT below is a PLACEHOLDER: set it to your own
+risk tolerance before any live use.
+
 IMPORTANT -- SAFE DEFAULTS
 
 The runner is in DRY-RUN mode unless --live is given explicitly, and
@@ -144,6 +157,8 @@ from phase_04_live.execution.executor import BrokerExecutor, ExecutionConfig
 from phase_04_live.market.live_source import LiveMarketSource
 from phase_04_live.market.models import QualityIssue
 from phase_04_live.recovery.safe_mode import SafeModeGate
+from phase_04_live.risk.daily_loss_limit import DailyLossLimit
+from phase_04_live.risk.equity import read_mt5_equity
 from phase_04_live.risk.kill_switch import EmergencyKillSwitch
 
 
@@ -170,6 +185,11 @@ STALE_AFTER_MISSED_CANDLES = 2
 # Durable operator-controlled state. Missing file means the first-ever run
 # is allowed; malformed or unreadable existing state fails closed.
 KILL_SWITCH_PATH = Path("state/kill_switch.json")
+
+# Daily loss limit. The state file stores the day's starting equity.
+# DAILY_LOSS_LIMIT_PERCENT is a PLACEHOLDER -- set your own value.
+DAILY_LOSS_STATE_PATH = Path("state/daily_loss.json")
+DAILY_LOSS_LIMIT_PERCENT = 2.0
 
 # Broker execution configuration
 EXECUTOR_MAX_ORDER_SIZE = 0.1  # Max order VOLUME in lots (checked when the request carries a volume)
@@ -314,6 +334,8 @@ def build_execution_consumer(
     safe_mode_gate: SafeModeGate,
     enable_dry_run: bool = True,
     order_sink: Optional[Callable] = None,
+    daily_loss_limit: Optional[DailyLossLimit] = None,
+    equity_provider: Optional[Callable[[], float]] = None,
 ) -> ExecutionEventConsumer:
     """
     Build the execution consumer and broker executor.
@@ -323,6 +345,9 @@ def build_execution_consumer(
     but not sent to the broker.
 
     Every order must carry a stop loss (require_stop_loss=True).
+
+    When daily_loss_limit and equity_provider are supplied, every order
+    is also checked against the day's loss allowance.
     """
 
     executor_config = ExecutionConfig(
@@ -337,6 +362,8 @@ def build_execution_consumer(
         safe_mode_gate=safe_mode_gate,
         config=executor_config,
         order_sink=order_sink,
+        daily_loss_limit=daily_loss_limit,
+        equity_provider=equity_provider,
     )
 
     consumer = ExecutionEventConsumer(
@@ -397,12 +424,21 @@ def main() -> int:
     kill_switch = EmergencyKillSwitch(KILL_SWITCH_PATH)
     safe_mode_gate = SafeModeGate(kill_switch)
 
+    # Daily loss limit: engages the same kill switch the engine reads.
+    daily_loss_limit = DailyLossLimit(
+        path=DAILY_LOSS_STATE_PATH,
+        kill_switch=kill_switch,
+        max_loss_percent=DAILY_LOSS_LIMIT_PERCENT,
+    )
+
     # Build execution consumer (optional; can be disabled)
     execution_consumer = build_execution_consumer(
         kill_switch=kill_switch,
         safe_mode_gate=safe_mode_gate,
         enable_dry_run=dry_run,
         order_sink=None,  # Implement your broker order submission here
+        daily_loss_limit=daily_loss_limit,
+        equity_provider=read_mt5_equity,
     )
 
     # Connect MT5 explicitly, BEFORE the first cycle runs. Do not
@@ -412,6 +448,27 @@ def main() -> int:
     # cycle one and raise "No IPC connection".
     print(f"Connecting to MT5 for {SYMBOL}...")
     live_source.connect()
+
+    # Record the day's starting equity as early as possible, so a loss
+    # that happens before the first order still counts. If this read
+    # fails, orders will still fail closed in the executor.
+    try:
+        loss_status = daily_loss_limit.check(read_mt5_equity())
+
+        if loss_status.breached:
+            print(f"Daily loss limit: {loss_status.reason}")
+        else:
+            print(
+                "Daily loss limit armed: start equity "
+                f"{loss_status.start_equity:.2f}, limit "
+                f"{loss_status.limit:.2f} ({DAILY_LOSS_LIMIT_PERCENT}%)."
+            )
+    except Exception as exc:
+        logger.error(
+            "Could not record starting equity for the daily loss limit: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
     try:
         if args.once:
