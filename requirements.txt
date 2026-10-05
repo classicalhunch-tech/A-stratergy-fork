@@ -2,5 +2,6 @@ pandas==3.0.6
 numpy==2.4.6
 pytest==9.1.1
 MetaTrader5; sys_platform == "win32"
+tzdata; sys_platform == "win32"
 # Versions above were tested on Linux, Python 3.11.16.
-# TODO: pin MetaTrader5 and the dashboard server packages once confirmed on the new laptop.
+# TODO: pin MetaTrader5, tzdata and the dashboard server packages once confirmed on the new laptop.
