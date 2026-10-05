@@ -24,7 +24,8 @@ htmlcov/
 *.feather
 
 # Big data files (back up separately)
-real_gold_data*.csv
+# NOTE: real_gold_data*.csv is deliberately NOT ignored any more, so the
+# real MT5 gold export can be committed and tested by CI.
 your_data_file*.csv
 gold_orderflow/data/
 market_data/data/
