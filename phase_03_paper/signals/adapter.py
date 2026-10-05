@@ -268,6 +268,21 @@ Do NOT create more than one StructureState per adapter instance, do
 NOT feed any row to step() more than once, and do NOT feed any swing
 to add_swings() more than once -- all three would silently break the
 equivalence guarantee this optimization depends on.
+
+ENTRY FILL MODE
+---------------
+
+The adapter also accepts strict_entry_fill (default False), which is
+forwarded verbatim to strategy/retest_engine.advance_pending_signal.
+
+    False -- original rule: a setup triggers as soon as price touches
+             the zone edge (LONG: zone top, SHORT: zone bottom).
+    True  -- limit-order realism: a setup only triggers once price
+             actually trades through the signal's entry price.
+
+The default keeps paper-trading behavior identical to every prior
+version of this adapter. Setting True makes live paper-trading fills
+match a real limit-order fill model.
 """
 
 
@@ -349,6 +364,7 @@ class StrategyAdapter:
         mtf_internal_tf: str = "15min",
         mtf_soft_internal_conflict: bool = False,
         mtf_min_bars: int = 200,
+        strict_entry_fill: bool = False,
     ) -> None:
 
         if max_bars_to_retest < 0:
@@ -378,6 +394,7 @@ class StrategyAdapter:
         self._max_bars_after_sweep = max_bars_after_sweep
         self._max_bars_from_break = max_bars_from_break
         self._warmup_bars = warmup_bars
+        self._strict_entry_fill = bool(strict_entry_fill)
 
         # --------------------------------------------------------
         # MTF (1H + 15M) confluence gate
@@ -1059,6 +1076,7 @@ class StrategyAdapter:
                 current_low=current_low,
                 visible_zones=visible_zones,
                 max_bars_to_retest=self._max_bars_to_retest,
+                strict_entry_fill=self._strict_entry_fill,
             )
 
             if outcome.outcome in {
@@ -1094,231 +1112,4 @@ class StrategyAdapter:
                             outcome.fill_price
                         ),
                         initial_risk=float(
-                            outcome.initial_risk
-                        ),
-                    )
-                )
-
-        self._pending_signals = still_pending
-
-    # ============================================================
-    # NEW SIGNAL DISCOVERY
-    # ============================================================
-
-    def _discover_new_signals(
-        self,
-        *,
-        current_index: int,
-        current_time: pd.Timestamp,
-        structure_breaks,
-        visible_zones,
-        liquidity_levels,
-        signal_context,
-        triggered_events: List[AdapterSignalEvent],
-    ) -> None:
-        """
-        Discover only signals whose structure break was born
-        on the current candle.
-        """
-
-        try:
-            current_structure_breaks = (
-                _current_structure_breaks(
-                    structure_breaks,
-                    current_time,
-                )
-            )
-
-            if not current_structure_breaks:
-                return
-
-            visible_liquidity_levels = (
-                _visible_liquidity_levels(
-                    liquidity_levels,
-                    current_time,
-                )
-            )
-
-            if not visible_liquidity_levels:
-                return
-
-            signals = generate_flip_zone_signals(
-                liquidity_levels=visible_liquidity_levels,
-                structure_breaks=current_structure_breaks,
-                zones=visible_zones,
-                max_bars_after_sweep=self._max_bars_after_sweep,
-                max_bars_from_break=self._max_bars_from_break,
-                max_bars_to_retest=self._max_bars_to_retest,
-                reward_multiple=self._reward_multiple,
-                stop_buffer=self._stop_buffer,
-                entry_mode=self._entry_mode,
-                precomputed_context=signal_context,
-                upto_index=current_index,
-                run_retest_simulation=False,
-                consumed_zones=self._consumed_zones,
-            )
-
-            if not signals:
-                return
-
-            for signal in signals:
-                self._register_signal_if_valid(
-                    signal=signal,
-                    current_index=current_index,
-                    current_time=current_time,
-                )
-
-        except Exception as exc:
-            self._record_error(
-                current_index,
-                "signal discovery",
-                exc,
-            )
-
-    def _register_signal_if_valid(
-        self,
-        *,
-        signal: TradeSignal,
-        current_index: int,
-        current_time: pd.Timestamp,
-    ) -> None:
-        """Validate and register a newly discovered pending signal.
-
-        Applies the MTF confluence gate (see self._mtf_filter_fn) after
-        all existing validation but before the signal enters pending
-        state. A rejected signal is simply not registered -- it is not
-        counted as invalidated or expired, matching how
-        strategy/backtest.py's run_backtest() treats mtf_filter_fn
-        rejections (total_mtf_rejected, never entered as pending).
-        """
-
-        break_index = getattr(
-            signal,
-            "bar_index",
-            None,
-        )
-
-        setup_index = getattr(
-            signal,
-            "setup_bar_index",
-            None,
-        )
-
-        if break_index is None or setup_index is None:
-            return
-
-        try:
-            break_index = int(break_index)
-            setup_index = int(setup_index)
-        except (TypeError, ValueError):
-            return
-
-        # Signal cannot reference the future.
-        if setup_index > current_index:
-            return
-
-        if break_index > current_index:
-            return
-
-        # Structure break must occur after setup.
-        if break_index <= setup_index:
-            return
-
-        # Only pending signals enter the adapter's pending state.
-        if signal.status != SignalStatus.PENDING_RETEST:
-            return
-
-        # New signal must be born on this exact candle.
-        if break_index != current_index:
-            return
-
-        signal_key = _make_setup_key(
-            signal,
-            break_index,
-        )
-
-        if signal_key in self._registered_setup_keys:
-            return
-
-        if self._mtf_enabled:
-            mtf_filter = self._get_mtf_filter(current_index)
-            if not mtf_filter(signal, current_time):
-                return
-
-        self._registered_setup_keys.add(
-            signal_key
-        )
-
-        self._pending_signals.append(
-            (signal, break_index)
-        )
-
-    # ============================================================
-    # DIAGNOSTICS
-    # ============================================================
-
-    def _get_mtf_filter(self, current_index: int):
-        """Build (once per tick, on demand) the MTF confluence filter.
-
-        FAIL-CLOSED: returns a reject-everything predicate when there is
-        too little history or MTF context building raises.
-        """
-        if self._mtf_filter_fn is not None:
-            return self._mtf_filter_fn
-
-        df = self._mtf_df
-
-        if df is None or len(df) < self._mtf_min_bars:
-            self._mtf_filter_fn = lambda signal, ts: False
-            return self._mtf_filter_fn
-
-        try:
-            df_enriched = build_mtf_dataset_with_structure(
-                df,
-                macro_swings_fn=self._mtf_swings_fn,
-                internal_swings_fn=self._mtf_swings_fn,
-                config=MTFConfig(
-                    macro_tf=self._mtf_macro_tf,
-                    internal_tf=self._mtf_internal_tf,
-                ),
-            )
-            self._mtf_filter_fn = build_mtf_signal_filter(
-                df_enriched,
-                soft_internal_conflict=self._mtf_soft_internal_conflict,
-            )
-        except Exception as exc:
-            self._record_error(current_index, "mtf context", exc)
-            self._mtf_filter_fn = lambda signal, ts: False
-
-        return self._mtf_filter_fn
-
-    def _record_error(
-        self,
-        current_index: int,
-        stage: str,
-        exc: Exception,
-    ) -> None:
-        """Record a structured adapter error."""
-
-        self._errors.append(
-            f"{current_index}: {stage} error: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    @property
-    def errors(self) -> List[str]:
-        """Return a copy of adapter errors."""
-
-        return list(self._errors)
-
-    @property
-    def pending_count(self) -> int:
-        """Number of currently pending strategy signals."""
-
-        return len(self._pending_signals)
-
-    @property
-    def candle_count(self) -> int:
-        """Number of candles processed by the adapter."""
-
-        return len(self._rows)
+                            outcome.initial
