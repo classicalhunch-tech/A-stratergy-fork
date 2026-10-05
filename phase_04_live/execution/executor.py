@@ -20,6 +20,11 @@ The executor does NOT:
     
 The executor's ONE job: safely transform a SIGNAL_TRIGGERED event into
 a broker order, with idempotency and kill-switch protection.
+
+Optional daily loss limit: when a DailyLossLimit and an equity_provider
+are both supplied, every order is also checked against the day's loss
+allowance. A breach engages the kill switch and rejects the order. When
+neither is supplied, behavior is exactly as before.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from phase_04_live.execution.models import (
     OrderExecutionStatus,
 )
 from phase_04_live.recovery.safe_mode import SafeModeGate
+from phase_04_live.risk.daily_loss_limit import DailyLossLimit
 from phase_04_live.risk.kill_switch import EmergencyKillSwitch
 
 
@@ -71,6 +77,8 @@ class BrokerExecutor:
             safe_mode_gate=safe_mode_gate,
             config=ExecutionConfig(),
             order_sink=mt5_submit_order,
+            daily_loss_limit=daily_loss_limit,   # optional
+            equity_provider=get_account_equity,  # required if the limit is set
         )
         
         request = ExecutionRequest(...)
@@ -87,11 +95,15 @@ class BrokerExecutor:
         safe_mode_gate: SafeModeGate,
         config: Optional[ExecutionConfig] = None,
         order_sink: Optional[Callable[[ExecutionRequest], Optional[str]]] = None,
+        daily_loss_limit: Optional[DailyLossLimit] = None,
+        equity_provider: Optional[Callable[[], float]] = None,
     ):
         self._kill_switch = kill_switch
         self._safe_mode_gate = safe_mode_gate
         self._config = config or ExecutionConfig()
         self._order_sink = order_sink
+        self._daily_loss_limit = daily_loss_limit
+        self._equity_provider = equity_provider
         
         # Deduplication: track what we've already submitted
         # key: idempotency_key, value: broker_order_id
@@ -228,6 +240,7 @@ class BrokerExecutor:
         
         Checks:
             1. Kill switch is not engaged (fresh read, not cached)
+            1b. Daily loss limit not reached (only when configured)
             2. Required fields are present and valid
             3. Order volume (lots) is within limits, when a volume is given
             4. Stop loss / take profit are on the correct side of the entry
@@ -244,6 +257,41 @@ class BrokerExecutor:
                 allowed=False,
                 reason=f"Kill switch engaged: {kill_switch_status.reason}",
             )
+        
+        # --------------------------------------------------------
+        # 1b. Daily loss limit (optional; fails closed)
+        #
+        # A breach engages the kill switch inside DailyLossLimit, so
+        # every later order is also stopped by check 1 above.
+        # --------------------------------------------------------
+        
+        if self._daily_loss_limit is not None:
+            if self._equity_provider is None:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        "Daily loss limit is configured but no "
+                        "equity_provider was supplied"
+                    ),
+                )
+            
+            try:
+                current_equity = self._equity_provider()
+            except Exception as exc:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=(
+                        "Could not read account equity: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            
+            loss_status = self._daily_loss_limit.check(current_equity)
+            if loss_status.breached:
+                return ExecutionGuardStatus(
+                    allowed=False,
+                    reason=f"Daily loss limit: {loss_status.reason}",
+                )
         
         # --------------------------------------------------------
         # 2. Request completeness
