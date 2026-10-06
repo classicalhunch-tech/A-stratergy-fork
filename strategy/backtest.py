@@ -94,6 +94,57 @@ def _calculate_r_multiple(
     return 0.0
 
 
+def _market_fill_is_valid(
+    direction: SignalType,
+    fill_price: float,
+    stop_loss: float,
+    take_profit: float,
+) -> bool:
+    """A market fill is only possible if price sits between stop and target."""
+
+    if abs(fill_price - stop_loss) <= EPSILON:
+        return False
+
+    if direction == SignalType.LONG:
+        return stop_loss + EPSILON < fill_price < take_profit - EPSILON
+
+    if direction == SignalType.SHORT:
+        return take_profit + EPSILON < fill_price < stop_loss - EPSILON
+
+    return False
+
+
+def _entry_bar_exit(
+    direction: SignalType,
+    stop_loss: float,
+    take_profit: float,
+    bar_high: float,
+    bar_low: float,
+):
+    """
+    Exit check for the bar a market order was filled on.
+    Stop is checked first (conservative, same as the main loop).
+    Returns (status, exit_price) or None.
+    """
+
+    if direction == SignalType.LONG:
+        hit_sl = bar_low <= stop_loss + EPSILON
+        hit_tp = bar_high >= take_profit - EPSILON
+    elif direction == SignalType.SHORT:
+        hit_sl = bar_high >= stop_loss - EPSILON
+        hit_tp = bar_low <= take_profit + EPSILON
+    else:
+        return None
+
+    if hit_sl:
+        return "LOSS", stop_loss
+
+    if hit_tp:
+        return "WIN", take_profit
+
+    return None
+
+
 def _make_setup_key(
     signal: TradeSignal,
     setup_idx: int,
@@ -402,7 +453,17 @@ def run_backtest(
     slippage: float = 0.0,
     commission: float = 0.0,
     strict_entry_fill: bool = False,
+    fill_mode: str = "touch",
 ) -> BacktestResult:
+    """
+    fill_mode:
+        "touch" (default) -- original behaviour (optionally combined
+            with strict_entry_fill).
+        "market_on_close" -- the signal triggers on zone-edge touch at
+            bar t, and the market order fills at the OPEN of bar t+1.
+            Mirrors what the live bot does (one fresh tick after a
+            closed candle triggers the signal).
+    """
 
     if df is None:
         return BacktestResult()
@@ -429,6 +490,16 @@ def run_backtest(
     if spread < 0 or slippage < 0 or commission < 0:
         raise ValueError(
             "spread, slippage and commission must be >= 0"
+        )
+
+    if fill_mode not in {"touch", "market_on_close"}:
+        raise ValueError(
+            "fill_mode must be 'touch' or 'market_on_close'"
+        )
+
+    if fill_mode == "market_on_close" and strict_entry_fill:
+        raise ValueError(
+            "strict_entry_fill cannot be combined with market_on_close"
         )
 
     round_trip_cost = spread + (2.0 * slippage) + commission
@@ -458,6 +529,7 @@ def run_backtest(
     pending_signals: List[Tuple[TradeSignal, int]] = []
     open_trades: List[Tuple[TradeResult, int]] = []
     registered_setup_keys: Set[tuple] = set()
+    moc_queue: List[Tuple[TradeSignal, float]] = []
 
     total_signals = 0
     total_triggered = 0
@@ -481,6 +553,69 @@ def run_backtest(
             all_zones,
             current_time,
         )
+
+        # A2. FILL QUEUED MARKET-ON-CLOSE ENTRIES AT THIS BAR'S OPEN
+
+        if moc_queue:
+
+            queued, moc_queue = moc_queue, []
+
+            for signal, planned_entry in queued:
+
+                fill_price = current_open
+                stop = float(signal.stop_loss)
+                target = float(signal.take_profit)
+
+                if not _market_fill_is_valid(
+                    signal.signal_type, fill_price, stop, target
+                ):
+                    total_invalidated += 1
+                    continue
+
+                signal.entry_price = float(fill_price)
+                signal.recalculate_risk_reward()
+
+                trade = TradeResult(
+                    signal=signal,
+                    direction=signal.signal_type,
+                    setup_time=signal.setup_timestamp,
+                    entry_time=current_time,
+                    entry_price=planned_entry,
+                    fill_price=float(fill_price),
+                    stop_loss=stop,
+                    take_profit=target,
+                    exit_price=0.0,
+                    initial_risk=abs(fill_price - stop),
+                    result_status="OPEN",
+                    r_multiple=0.0,
+                    bars_held=0,
+                    session=str(
+                        getattr(signal, "session", "UNKNOWN")
+                    ),
+                )
+
+                total_triggered += 1
+
+                exit_info = _entry_bar_exit(
+                    trade.direction,
+                    stop,
+                    target,
+                    current_high,
+                    current_low,
+                )
+
+                if exit_info is not None:
+                    status, exit_price = exit_info
+                    _close_trade(
+                        trade=trade,
+                        exit_time=current_time,
+                        exit_price=exit_price,
+                        result_status=status,
+                        round_trip_cost=round_trip_cost,
+                    )
+                    completed_trades.append(trade)
+                else:
+                    open_trades.append((trade, i))
 
         # B. MANAGE OPEN TRADES
 
@@ -572,6 +707,12 @@ def run_backtest(
 
             if outcome.outcome == PendingOutcomeType.STILL_PENDING:
                 still_pending.append((signal, setup_idx))
+                continue
+
+            if fill_mode == "market_on_close":
+                moc_queue.append(
+                    (signal, float(outcome.planned_entry))
+                )
                 continue
 
             trade = TradeResult(
