@@ -1,4 +1,3 @@
-
 """
 phase_04_live/market/live_source.py
 
@@ -92,6 +91,17 @@ class LiveMarketSource(MarketDataSource):
         if self._connected:
             mt5.shutdown()
             self._connected = False
+
+    def mark_history_loaded(self, last_candle: Candle) -> None:
+        """
+        Call after warming up the strategy with historical candles.
+
+        Treats every candle up to and including last_candle as already
+        processed, so stream() does not deliver them again, and seeds the
+        quality filter so ordering and duplicate checks continue from there.
+        """
+        self._last_seen_timestamp = last_candle.timestamp
+        self._quality_filter.seed(last_candle)
 
     def fetch_latest(self, count: int = 1) -> list[Candle]:
         """
