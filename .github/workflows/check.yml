@@ -49,6 +49,14 @@ jobs:
           python main.py --data data/real_gold_data_5m.csv \
                          --spread 0.30 --slippage 0.10 --commission 0.0
 
+      - name: 1e. Fill rule comparison and cost sensitivity (real data)
+        continue-on-error: true
+        run: python tools/compare_fill_modes.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 1f. Data schedule check (time zone and daylight saving)
+        continue-on-error: true
+        run: python tools/check_data_sessions.py --data data/real_gold_data_5m.csv
+
       - name: 2. Tracked files that .gitignore would ignore
         continue-on-error: true
         run: git ls-files -ci --exclude-standard
@@ -91,6 +99,10 @@ jobs:
 
       - name: 6. MTF look-ahead test
         run: python tests/test_mtf_causality.py
+
+      - name: 6b. MTF look-ahead test on real data
+        continue-on-error: true
+        run: python tests/test_mtf_causality.py data/real_gold_data_5m.csv
 
       - name: 7. Hard-coded credentials check (file and line only)
         continue-on-error: true
