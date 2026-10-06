@@ -1,13 +1,16 @@
 """
 tools/compare_fill_modes.py
 
-Compares the backtest under two fill rules and shows how robust the result is.
+Compares the backtest under three fill rules and shows how robust the result is.
 
   default fill rule : a setup fills as soon as price touches the zone edge
   strict fill rule  : a setup fills only if price trades through the entry
                       price (limit-order realism, strict_entry_fill=True)
+  market on close   : the setup triggers on zone-edge touch at bar t, and a
+                      market order fills at the OPEN of bar t+1 (what the live
+                      bot effectively does, fill_mode="market_on_close")
 
-Both runs use zero trading costs. Costs never change which trades trigger or
+All runs use zero trading costs. Costs never change which trades trigger or
 where they exit, so net results for several cost levels are computed after
 the fact:
 
@@ -126,14 +129,16 @@ def main() -> None:
     )
     mtf_filter = build_mtf_signal_filter(df_enriched)
 
-    for strict, title in (
-        (False, "DEFAULT fill rule (fills on zone-edge touch)"),
-        (True, "STRICT fill rule (fills only if price reaches the entry)"),
+    for strict, fill_mode, title in (
+        (False, "touch", "DEFAULT fill rule (fills on zone-edge touch)"),
+        (True, "touch", "STRICT fill rule (fills only if price reaches the entry)"),
+        (False, "market_on_close", "MARKET ON CLOSE (touch, then fill at next bar's open)"),
     ):
         result = run_backtest(
             df,
             mtf_filter_fn=mtf_filter,
             strict_entry_fill=strict,
+            fill_mode=fill_mode,
         )
         print_mode(title, result)
 
