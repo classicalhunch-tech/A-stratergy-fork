@@ -88,7 +88,7 @@ jobs:
 
       - name: 9. Syntax check of live code (cannot be imported on Linux)
         continue-on-error: true
-        run: python -m py_compile phase_04_live/main.py phase_04_live/market/live_source.py phase_04_live/broker/mt5.py && echo "syntax OK"
+        run: python -m py_compile phase_04_live/main.py phase_04_live/market/live_source.py phase_04_live/broker/mt5.py phase_04_live/runtime/loop.py && echo "syntax OK"
 
       - name: 10. Verification greps and tested package versions
         continue-on-error: true
@@ -106,3 +106,8 @@ jobs:
           git grep -nE 'strategy\.rules|TradingRules' -- '*.py' | head -20 || true
           echo "----- MTFConfig defaults -----"
           grep -nE 'macro_tf|internal_tf|base_interval|origin' dashboard/mtf_context.py | head -20 || true
+
+      - name: 11. mark_history_loaded must be called in the live loop
+        run: |
+          git grep -n "mark_history_loaded" -- phase_04_live
+          git grep -q "mark_history_loaded" -- phase_04_live/runtime/loop.py || { echo "NOT CALLED in loop.py"; exit 1; }
