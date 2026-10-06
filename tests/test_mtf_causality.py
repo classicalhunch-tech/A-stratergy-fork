@@ -47,8 +47,8 @@ def _norm(value):
     return None if pd.isna(value) else str(value)
 
 
-def run_check(total_rows=TOTAL_ROWS):
-    df_all = load_5m_data(str(DATA_PATH))
+def run_check(total_rows=TOTAL_ROWS, data_path=DATA_PATH):
+    df_all = load_5m_data(str(data_path))
     df = df_all.iloc[-total_rows:].copy()
     n = len(df)
 
@@ -91,7 +91,8 @@ def test_mtf_has_no_lookahead():
 
 
 if __name__ == "__main__":
-    comparisons, mismatches, num_cuts = run_check()
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else DATA_PATH
+    comparisons, mismatches, num_cuts = run_check(data_path=path)
     print("-" * 50)
     print(f"Cut points tested: {num_cuts}")
     print(f"Comparisons made:  {comparisons}")
