@@ -422,8 +422,10 @@ def run_live_loop(
             continue
         _warmup_discarded += len(_events)
 
-    # These candles are already consumed; stream() must only yield newer ones.
-    market_source._last_seen_timestamp = warmup_candles[-1].timestamp
+    # CHANGED: these candles are already consumed; stream() must only yield
+    # newer ones, and the quality filter must continue from the end of this
+    # history.
+    market_source.mark_history_loaded(warmup_candles[-1])
 
     print(
         f"[warmup] fed {len(warmup_candles)} candles "
