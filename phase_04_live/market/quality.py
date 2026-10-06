@@ -16,7 +16,7 @@ first gap (weekend, daily market break, outage) until restart. The
 live source therefore uses reject_gaps=False: the gap is still
 reported as a QualityIssue, but the candle is accepted and becomes the
 new baseline. Real market data contains weekend and break gaps too,
-and the backtest data does as well.
+and the backtest data as well.
 """
 
 from datetime import datetime, timezone
@@ -92,6 +92,16 @@ class QualityFilter:
         key = (candle.symbol, candle.timeframe)
         self._last_accepted[key] = candle
         return True, gap_issue
+
+    def seed(self, candle: Candle) -> None:
+        """
+        Record candle as the last accepted one without checking it.
+
+        Used after loading historical candles at startup, so ordering,
+        duplicate and gap checks continue from the end of that history.
+        """
+        key = (candle.symbol, candle.timeframe)
+        self._last_accepted[key] = candle
 
     def _check_price_validity(self, candle: Candle) -> Optional[QualityIssue]:
         """Reject candles with zero or negative prices."""
