@@ -43,6 +43,12 @@ jobs:
           print("median 5m range:", float((df["high"] - df["low"]).median()))
           EOF
 
+      - name: 1d. Backtest — real gold data with real costs
+        continue-on-error: true
+        run: |
+          python main.py --data data/real_gold_data_5m.csv \
+                         --spread 0.30 --slippage 0.10 --commission 0.0
+
       - name: 2. Tracked files that .gitignore would ignore
         continue-on-error: true
         run: git ls-files -ci --exclude-standard
@@ -56,6 +62,21 @@ jobs:
           gaps = df.index.to_series().diff().dropna()
           print("rows:", len(df), "| range:", df.index[0], "->", df.index[-1])
           print("columns:", list(df.columns))
+          print("gaps longer than 30 min:", int((gaps > pd.Timedelta(minutes=30)).sum()))
+          print("candles on Saturday:", int((df.index.dayofweek == 5).sum()))
+          EOF
+
+      - name: 3b. Real gold data sanity
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/real_gold_data_5m.csv", index_col=0, parse_dates=True)
+          gaps = df.index.to_series().diff().dropna()
+          print("rows:", len(df))
+          print("range:", df.index[0], "->", df.index[-1])
+          print("close min:", float(df["close"].min()), "| close max:", float(df["close"].max()))
+          print("median 5m range:", float((df["high"] - df["low"]).median()))
           print("gaps longer than 30 min:", int((gaps > pd.Timedelta(minutes=30)).sum()))
           print("candles on Saturday:", int((df.index.dayofweek == 5).sum()))
           EOF
