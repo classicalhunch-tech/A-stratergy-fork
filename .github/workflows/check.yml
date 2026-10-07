@@ -10,7 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       PYTHONPATH: .
     steps:
@@ -149,3 +149,8 @@ jobs:
         if: always()
         continue-on-error: true
         run: python tools/mtf_split.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 13. Pattern tags and fill-anchored target (market on close)
+        if: always()
+        continue-on-error: true
+        run: python tools/pattern_report.py --data data/real_gold_data_5m.csv --rows 40000
