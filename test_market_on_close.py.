@@ -1,0 +1,60 @@
+import pandas as pd
+import pytest
+
+from strategy.backtest import (
+    _entry_bar_exit,
+    _market_fill_is_valid,
+    run_backtest,
+)
+from strategy.signals import SignalType
+
+
+def test_long_fill_must_sit_between_stop_and_target():
+    assert _market_fill_is_valid(SignalType.LONG, 100.0, 98.0, 104.0)
+    assert not _market_fill_is_valid(SignalType.LONG, 97.0, 98.0, 104.0)
+    assert not _market_fill_is_valid(SignalType.LONG, 105.0, 98.0, 104.0)
+    assert not _market_fill_is_valid(SignalType.LONG, 98.0, 98.0, 104.0)
+
+
+def test_short_fill_must_sit_between_target_and_stop():
+    assert _market_fill_is_valid(SignalType.SHORT, 100.0, 102.0, 96.0)
+    assert not _market_fill_is_valid(SignalType.SHORT, 103.0, 102.0, 96.0)
+    assert not _market_fill_is_valid(SignalType.SHORT, 95.0, 102.0, 96.0)
+
+
+def test_entry_bar_stop_wins_when_both_levels_hit():
+    # Same conservative rule as the main loop: stop is checked first.
+    result = _entry_bar_exit(SignalType.LONG, 98.0, 104.0, 105.0, 97.0)
+    assert result == ("LOSS", 98.0)
+
+
+def test_entry_bar_target_and_no_exit():
+    assert _entry_bar_exit(SignalType.LONG, 98.0, 104.0, 105.0, 99.0) == ("WIN", 104.0)
+    assert _entry_bar_exit(SignalType.SHORT, 102.0, 96.0, 101.0, 95.0) == ("WIN", 96.0)
+    assert _entry_bar_exit(SignalType.LONG, 98.0, 104.0, 103.0, 99.0) is None
+
+
+def test_invalid_fill_mode_rejected():
+    df = pd.DataFrame(
+        {"open": [1.0] * 6, "high": [1.1] * 6, "low": [0.9] * 6, "close": [1.0] * 6},
+        index=pd.date_range("2026-01-01", periods=6, freq="5min"),
+    )
+    with pytest.raises(ValueError):
+        run_backtest(df, fill_mode="nonsense")
+    with pytest.raises(ValueError):
+        run_backtest(df, fill_mode="market_on_close", strict_entry_fill=True)
+
+
+def test_market_on_close_fills_at_next_bar_open():
+    df = pd.read_csv("data/master_historical_data.csv", index_col=0, parse_dates=True)
+
+    base = run_backtest(df)
+    same = run_backtest(df, fill_mode="touch")
+    assert len(base.trades) == len(same.trades)
+
+    moc = run_backtest(df, fill_mode="market_on_close")
+    assert not moc.errors
+    for t in moc.trades:
+        assert t.entry_time > t.signal.triggered_at_time
+        assert t.fill_price == pytest.approx(float(df.loc[t.entry_time, "open"]))
+        assert t.initial_risk == pytest.approx(abs(t.fill_price - t.stop_loss))
