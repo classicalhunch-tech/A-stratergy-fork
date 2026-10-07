@@ -23,6 +23,7 @@ from strategy.retest_engine import (
     PendingOutcomeType,
 )
 
+from strategy.atr import known_atr
 from strategy.swings import find_swings
 from strategy.structure import analyze_structure
 
@@ -487,6 +488,10 @@ def run_backtest(
     strict_entry_fill: bool = False,
     fill_mode: str = "touch",
     target_anchor: str = "zone",
+    target_fn: Optional[
+        Callable[[SignalType, float, float, pd.Timestamp], Optional[float]]
+    ] = None,
+    stop_atr_mult: float = 0.0,
 ) -> BacktestResult:
     """
     fill_mode:
@@ -497,13 +502,18 @@ def run_backtest(
             Mirrors what the live bot does (one fresh tick after a
             closed candle triggers the signal).
 
-    target_anchor (only with fill_mode="market_on_close"):
+    target_anchor (non-default values need fill_mode="market_on_close"):
         "zone" (default) -- take profit stays where the zone-midpoint
             entry put it (the original behaviour).
-        "fill" -- take profit is recomputed as reward_multiple x the
-            real risk (fill price to stop), so reward:risk is what
-            reward_multiple says even when the fill is far from the
-            midpoint.
+        "fill" -- take profit = reward_multiple x the real risk
+            (fill price to stop).
+        "structure" -- take profit = target_fn(direction, fill, stop,
+            fill_time), e.g. the nearest confirmed 15M swing. A None
+            result skips the trade.
+
+    stop_atr_mult (needs fill_mode="market_on_close"):
+        Widens the stop beyond the zone edge by stop_atr_mult x ATR(14)
+        known at the fill bar's open. 0.0 (default) = unchanged.
     """
 
     if df is None:
@@ -543,14 +553,28 @@ def run_backtest(
             "strict_entry_fill cannot be combined with market_on_close"
         )
 
-    if target_anchor not in {"zone", "fill"}:
+    if target_anchor not in {"zone", "fill", "structure"}:
         raise ValueError(
-            "target_anchor must be 'zone' or 'fill'"
+            "target_anchor must be 'zone', 'fill' or 'structure'"
         )
 
-    if target_anchor == "fill" and fill_mode != "market_on_close":
+    if target_anchor != "zone" and fill_mode != "market_on_close":
         raise ValueError(
-            "target_anchor='fill' requires fill_mode='market_on_close'"
+            "target_anchor 'fill'/'structure' requires "
+            "fill_mode='market_on_close'"
+        )
+
+    if target_anchor == "structure" and target_fn is None:
+        raise ValueError(
+            "target_anchor='structure' requires target_fn"
+        )
+
+    if stop_atr_mult < 0:
+        raise ValueError("stop_atr_mult must be >= 0")
+
+    if stop_atr_mult > 0 and fill_mode != "market_on_close":
+        raise ValueError(
+            "stop_atr_mult > 0 requires fill_mode='market_on_close'"
         )
 
     round_trip_cost = spread + (2.0 * slippage) + commission
@@ -581,6 +605,10 @@ def run_backtest(
     open_trades: List[Tuple[TradeResult, int]] = []
     registered_setup_keys: Set[tuple] = set()
     moc_queue: List[Tuple[TradeSignal, float]] = []
+
+    atr_known = (
+        known_atr(df).to_numpy() if stop_atr_mult > 0 else None
+    )
 
     total_signals = 0
     total_triggered = 0
@@ -616,6 +644,21 @@ def run_backtest(
                 fill_price = current_open
                 stop = float(signal.stop_loss)
 
+                if stop_atr_mult > 0:
+
+                    atr_now = atr_known[i]
+
+                    if pd.isna(atr_now):
+                        total_invalidated += 1
+                        continue
+
+                    if signal.signal_type == SignalType.LONG:
+                        stop = stop - stop_atr_mult * float(atr_now)
+                    else:
+                        stop = stop + stop_atr_mult * float(atr_now)
+
+                    signal.stop_loss = stop
+
                 if target_anchor == "fill":
 
                     anchored = _fill_anchored_target(
@@ -630,6 +673,22 @@ def run_backtest(
                         continue
 
                     target = float(anchored)
+                    signal.take_profit = target
+
+                elif target_anchor == "structure":
+
+                    structural = target_fn(
+                        signal.signal_type,
+                        fill_price,
+                        stop,
+                        current_time,
+                    )
+
+                    if structural is None:
+                        total_invalidated += 1
+                        continue
+
+                    target = float(structural)
                     signal.take_profit = target
 
                 else:
