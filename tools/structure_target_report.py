@@ -4,9 +4,16 @@ tools/structure_target_report.py
 Market-on-close, no MTF gate. Compares fixed-R targets anchored to the fill
 with the structural 15M-swing target (skip variant and advance variant),
 split by pattern label. Costs applied after the fact.
+
+Two views:
+  1. Per-run tables with a standard error on every row. A group is not
+     distinguishable from zero unless |net| is well above 2 x SE.
+  2. A paired comparison on the trades that BOTH runs took, so exit
+     differences are not mixed up with which trades each run selected.
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -46,6 +53,31 @@ def closed(result):
     ]
 
 
+def net_r(trade):
+    """R after cost. The backtest runs with zero cost, so r_multiple is gross."""
+    return trade.r_multiple - COST / trade.initial_risk
+
+
+def mean_se(values):
+    n = len(values)
+    if n == 0:
+        return 0, float("nan"), float("nan")
+    mean = sum(values) / n
+    if n < 2:
+        return n, mean, float("nan")
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return n, mean, math.sqrt(var / n)
+
+
+def trade_key(trade):
+    direction = getattr(trade.direction, "value", trade.direction)
+    return (
+        pd.Timestamp(trade.entry_time),
+        str(direction),
+        round(float(trade.stop_loss), 4),
+    )
+
+
 def summarize(label, trades):
     if not trades:
         print(f"   {label:16s}    0 trades")
@@ -53,17 +85,55 @@ def summarize(label, trades):
 
     wins = sum(1 for t in trades if t.result_status == "WIN")
     gross = sum(t.r_multiple for t in trades) / len(trades)
-    net = sum(t.r_multiple - COST / t.initial_risk for t in trades) / len(trades)
+    _, net, se = mean_se([net_r(t) for t in trades])
     stops = sorted(t.initial_risk for t in trades)
-    planned = sorted(abs(t.take_profit - t.fill_price) / t.initial_risk for t in trades)
+    planned = sorted(
+        abs(t.take_profit - t.fill_price) / t.initial_risk for t in trades
+    )
     flag = " *" if len(trades) < MIN_TRADES else ""
 
     print(
         f"   {label:16s} {len(trades):4d} trades  win {100.0 * wins / len(trades):5.1f}%"
-        f"  gross {gross:+.3f}R  net@{COST} {net:+.3f}R"
+        f"  gross {gross:+.3f}R  net@{COST} {net:+.3f}R (SE {se:.3f})"
         f"  median stop {stops[len(stops) // 2]:.2f}"
         f"  median planned RR {planned[len(planned) // 2]:.2f}{flag}"
     )
+
+
+def paired(name_a, trades_a, name_b, trades_b):
+    """Compare two runs on the trades both of them took."""
+    by_key_a = {}
+    for t in trades_a:
+        by_key_a.setdefault(trade_key(t), t)
+
+    by_key_b = {}
+    for t in trades_b:
+        by_key_b.setdefault(trade_key(t), t)
+
+    common = sorted(set(by_key_a) & set(by_key_b))
+
+    print(f"   {name_a}  vs  {name_b}")
+    print(
+        f"      trades in A: {len(by_key_a)}, in B: {len(by_key_b)}, "
+        f"in both: {len(common)}"
+    )
+
+    if len(common) < 2:
+        print("      too few common trades to compare")
+        return
+
+    a_vals = [net_r(by_key_a[k]) for k in common]
+    b_vals = [net_r(by_key_b[k]) for k in common]
+    diffs = [a - b for a, b in zip(a_vals, b_vals)]
+
+    _, mean_a, se_a = mean_se(a_vals)
+    _, mean_b, se_b = mean_se(b_vals)
+    _, mean_d, se_d = mean_se(diffs)
+
+    flag = " *" if len(common) < MIN_TRADES else ""
+
+    print(f"      A net {mean_a:+.3f}R (SE {se_a:.3f})   B net {mean_b:+.3f}R (SE {se_b:.3f})")
+    print(f"      A minus B {mean_d:+.3f}R (SE {se_d:.3f}){flag}")
 
 
 def main():
@@ -100,6 +170,9 @@ def main():
         ("structure (advance to 1.5R)", "structure", 2.0, advance_fn),
     ]
 
+    trades_by_run = {}
+    baseline_invalidated = None
+
     for name, anchor, rm, fn in runs:
         result = run_backtest(
             df,
@@ -110,6 +183,10 @@ def main():
             target_fn=fn,
         )
         trades = closed(result)
+        trades_by_run[name] = trades
+
+        if baseline_invalidated is None:
+            baseline_invalidated = result.total_invalidated
 
         print()
         print(f"{name}  (market on close, no MTF gate)")
@@ -119,6 +196,11 @@ def main():
             f"invalidated/skipped {result.total_invalidated}, "
             f"expired {result.total_expired}"
         )
+
+        if anchor == "structure":
+            skipped = result.total_invalidated - baseline_invalidated
+            print(f"   skipped by the target rule (vs fill 2R): about {skipped}")
+
         summarize("ALL", trades)
         for label in PATTERN_LABELS:
             group = [
@@ -131,7 +213,26 @@ def main():
             print(f"   WARNING: {len(result.errors)} errors; first: {result.errors[0]}")
 
     print()
-    print(f"* = fewer than {MIN_TRADES} trades")
+    print("=" * 60)
+    print("PAIRED COMPARISON (only trades both runs took)")
+    print("=" * 60)
+
+    for struct_name in (
+        "structure (skip if <1.5R)",
+        "structure (advance to 1.5R)",
+    ):
+        for fixed_name in ("fill 5R", "fill 2R"):
+            print()
+            paired(
+                struct_name,
+                trades_by_run[struct_name],
+                fixed_name,
+                trades_by_run[fixed_name],
+            )
+
+    print()
+    print(f"* = fewer than {MIN_TRADES} trades: treat as noise")
+    print("A result is not distinguishable from zero unless |net| is well above 2 x SE.")
     print(f"Total runtime: {time.perf_counter() - started:.1f}s")
 
 
