@@ -10,7 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PYTHONPATH: .
     steps:
@@ -47,7 +47,7 @@ jobs:
           print("median 5m range:", float((df["high"] - df["low"]).median()))
           EOF
 
-      - name: 1d. Backtest — real gold data with real costs (baseline, direction gate ON)
+      - name: 1d. Backtest, real gold data with real costs (baseline, direction gate ON)
         continue-on-error: true
         run: |
           python main.py --data data/real_gold_data_5m.csv \
@@ -158,6 +158,101 @@ jobs:
         if: always()
         continue-on-error: true
         run: python tools/pattern_report.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 14. Structural target vs fixed R (market on close, no MTF gate)
+        if: always()
+        continue-on-error: true
+        run: python tools/structure_target_report.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 15. ATR stop A/B (0.10 vs 0.25 x ATR(14))
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          from strategy.backtest import run_backtest
+          from dashboard.mtf_context import MTFConfig
+          from strategy.mtf_structure import build_mtf_dataset_with_structure
+          from strategy.swings import find_swings
+
+          DATA = "data/real_gold_data_5m.csv"
+          ROWS = 40000
+          COST = 0.5
+          MIN_TRADES = 20
+
+          df = pd.read_csv(DATA, index_col=0, parse_dates=True)
+          df.columns = [c.strip().lower() for c in df.columns]
+          df = df[["open", "high", "low", "close"]].astype(float).dropna()
+          df = df.tail(ROWS)
+
+          enriched = build_mtf_dataset_with_structure(
+              df,
+              macro_swings_fn=find_swings,
+              internal_swings_fn=find_swings,
+              config=MTFConfig(macro_tf="1h", internal_tf="15min"),
+          )
+
+          def make_tagger(tagger):
+              def fn(signal, current_time):
+                  signal.pattern = tagger(signal, current_time)
+                  return True
+              return fn
+
+          try:
+              from strategy.pattern_tags import build_pattern_tagger, PATTERN_LABELS
+              tagger = build_pattern_tagger(enriched)
+              mf = make_tagger(tagger)
+          except Exception as exc:
+              print(f"pattern tagger unavailable: {exc}")
+              mf = None
+              PATTERN_LABELS = []
+
+          def closed(result):
+              return [t for t in result.trades
+                      if t.result_status in ("WIN", "LOSS") and t.initial_risk > 0]
+
+          def summarize(label, trades):
+              if not trades:
+                  print(f"   {label:16s}    0 trades")
+                  return
+              wins = sum(1 for t in trades if t.result_status == "WIN")
+              net = sum(t.r_multiple - COST / t.initial_risk
+                        for t in trades) / len(trades)
+              stops = sorted(t.initial_risk for t in trades)
+              flag = " *" if len(trades) < MIN_TRADES else ""
+              print(f"   {label:16s} {len(trades):4d} trades  "
+                    f"win {100.0*wins/len(trades):5.1f}%  "
+                    f"net@{COST} {net:+.3f}R  "
+                    f"median stop {stops[len(stops)//2]:.2f}{flag}")
+
+          for atr_mult in (0.0, 0.10, 0.25):
+              print()
+              print(f"=== stop_atr_mult = {atr_mult} (market on close, no MTF gate) ===")
+              result = run_backtest(
+                  df,
+                  reward_multiple=2.0,
+                  mtf_filter_fn=mf,
+                  fill_mode="market_on_close",
+                  target_anchor="zone",
+                  stop_atr_mult=atr_mult,
+              )
+              trades = closed(result)
+              print(f"   candidates {result.total_signals_generated}, "
+                    f"triggered {result.total_trades_triggered}, "
+                    f"invalidated {result.total_invalidated}, "
+                    f"expired {result.total_expired}")
+              summarize("ALL", trades)
+              for label in PATTERN_LABELS:
+                  group = [t for t in trades
+                           if getattr(t.signal, "pattern", "U_unknown") == label]
+                  summarize(label, group)
+              if result.errors:
+                  print(f"   WARNING: {len(result.errors)} errors; "
+                        f"first: {result.errors[0]}")
+
+          print()
+          print(f"* = fewer than {MIN_TRADES} trades")
+          EOF
 
   # ---------------------------------------------------------------
   # Experiments: direction gate ON vs OFF at 2R / 3R / 5R.
