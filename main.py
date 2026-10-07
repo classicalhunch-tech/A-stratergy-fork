@@ -34,24 +34,39 @@ The strategy engines remain responsible for:
     - MTF structure
     - MTF confluence
 
-The gap this version closes: previously, main.py generated raw 5M
-candidates and reported which ones WOULD pass MTF confluence, but
-never executed a single trade -- run_backtest() (the tested engine
-with 79+ passing tests, restart-equivalence, walk-forward validation)
-had no MTF awareness at all. Now run_backtest() accepts an optional
-mtf_filter_fn hook: when None (the default), behavior is unchanged
-from every existing test. When provided, only MTF-approved signals
-proceed to entry/retest/execution. No execution logic is duplicated
-here -- the confluence gate is checked, then the same tested engine
-runs exactly as it always has.
+run_backtest() accepts an optional mtf_filter_fn hook: when None it
+behaves exactly as in every existing test. When provided, only
+MTF-approved signals proceed to entry/retest/execution. No execution
+logic is duplicated here.
+
+Direction gate
+--------------
+By default the MTF filter requires the 1H (and 15M) trend to agree
+with the trade direction (the original behavior). The strategy is a
+counter-trend reversal from higher-timeframe zones, so
+--no-direction-gate turns the direction requirement off. The 1H/15M
+trend labels are then only written as tags in the --output CSV.
 
 Trading costs
 -------------
 --spread, --slippage and --commission are passed straight through to
 run_backtest(). All three are in PRICE UNITS (for XAUUSD, 0.30 means
-30 cents) and default to 0.0, which reproduces the original cost-free
-result exactly. The round-trip cost deducted from each closed trade is
-spread + (2 * slippage) + commission.
+30 cents) and default to 0.0. The round-trip cost deducted from each
+closed trade is spread + (2 * slippage) + commission, converted to R
+by dividing by that trade's initial risk (fill to stop).
+
+Because costs are in price units, they must match the price scale of
+the data. A guard refuses to run when the round-trip cost is more than
+half the median 5M candle range (for example gold-scale costs on
+EURUSD-scale data), because the resulting R numbers would be
+meaningless.
+
+Exit / fill options
+-------------------
+--reward-multiple, --fill-mode, --target-anchor and
+--strict-entry-fill are passed straight through to run_backtest().
+Defaults equal run_backtest()'s own defaults, so omitting them
+reproduces the previous results exactly.
 """
 
 import argparse
@@ -64,7 +79,7 @@ import pandas as pd
 
 from strategy.backtest import run_backtest
 from strategy.mtf_structure import build_mtf_dataset_with_structure
-from strategy.confluence import build_mtf_signal_filter
+from strategy.confluence import build_mtf_signal_filter, build_mtf_tag_fn
 from strategy.swings import find_swings
 from dashboard.mtf_context import MTFConfig
 
@@ -78,6 +93,11 @@ REQUIRED_OHLC_COLUMNS = {"open", "high", "low", "close"}
 # Multi-timeframe settings (one place to change them)
 MTF_MACRO_TF = "1h"
 MTF_INTERNAL_TF = "15min"
+
+# Costs may not exceed this fraction of the median 5M candle range.
+# Real gold: median range ~4.35, a 0.50 cost is ~0.11 of it -- fine.
+# Gold-scale costs on EURUSD-scale data is ~1500x -- refused.
+MAX_COST_TO_RANGE_RATIO = 0.5
 
 # Errors we treat as EXPECTED pipeline conditions (bad input, bad data).
 # These get a clean one-line message because the user can act on them.
@@ -158,6 +178,44 @@ def load_5m_data(csv_path: str) -> pd.DataFrame:
 
 
 # =====================================================================
+# Step 1b: Guard against cost / price-scale mismatch
+# =====================================================================
+
+def check_cost_scale(
+    df_5m: pd.DataFrame,
+    spread: float,
+    slippage: float,
+    commission: float,
+) -> None:
+    """
+    Refuse to run when trading costs are on a different price scale
+    than the data.
+
+    Costs are in price units. If the round-trip cost is more than
+    MAX_COST_TO_RANGE_RATIO of the median 5M candle range, every trade
+    would be charged many R of cost and the expectancy would be
+    meaningless (e.g. gold-scale 0.30 spread on EURUSD-scale data
+    produced -2650R). Fail loudly instead of printing that number.
+    """
+
+    round_trip_cost = spread + (2.0 * slippage) + commission
+
+    if round_trip_cost <= 0:
+        return
+
+    median_range = float((df_5m["high"] - df_5m["low"]).median())
+
+    if round_trip_cost > MAX_COST_TO_RANGE_RATIO * median_range:
+        raise ValueError(
+            f"Round-trip cost {round_trip_cost} (spread + 2*slippage + "
+            f"commission) is more than {MAX_COST_TO_RANGE_RATIO:.0%} of "
+            f"the median 5M candle range ({median_range:.6f}). Costs are "
+            f"in price units, and this data is on a different price scale "
+            f"than the costs assume. Use real gold data or scale the costs."
+        )
+
+
+# =====================================================================
 # Step 2: Build MTF structural context
 # =====================================================================
 
@@ -207,6 +265,11 @@ def run_mtf_gated_backtest(
     spread: float = 0.0,
     slippage: float = 0.0,
     commission: float = 0.0,
+    gate_direction: bool = True,
+    reward_multiple: float = 2.0,
+    fill_mode: str = "touch",
+    target_anchor: str = "zone",
+    strict_entry_fill: bool = False,
 ):
     """
     Run the SAME tested run_backtest() engine used by Phase 1/2/3,
@@ -221,19 +284,31 @@ def run_mtf_gated_backtest(
 
     spread, slippage and commission are in price units and are passed
     straight through to run_backtest(). All default to 0.0.
+
+    gate_direction=False removes the 1H/15M trend-direction
+    requirement (counter-trend entries allowed).
+
+    reward_multiple, fill_mode, target_anchor and strict_entry_fill
+    are passed straight through to run_backtest(); defaults equal
+    run_backtest()'s own defaults.
     """
 
     mtf_filter_fn = build_mtf_signal_filter(
         df_enriched,
         allow_neutral_internal=allow_neutral_internal,
+        gate_direction=gate_direction,
     )
 
     result = run_backtest(
         df_5m,
+        reward_multiple=reward_multiple,
         mtf_filter_fn=mtf_filter_fn,
         spread=spread,
         slippage=slippage,
         commission=commission,
+        strict_entry_fill=strict_entry_fill,
+        fill_mode=fill_mode,
+        target_anchor=target_anchor,
     )
 
     closed_count = sum(
@@ -247,6 +322,15 @@ def run_mtf_gated_backtest(
     print(
         "Costs (price units):              "
         f"spread={spread} slippage={slippage} commission={commission}"
+    )
+    print(
+        "Direction gate:                   "
+        f"{'ON' if gate_direction else 'OFF (counter-trend allowed)'}"
+    )
+    print(
+        "Exit / fill settings:             "
+        f"reward={reward_multiple}R fill_mode={fill_mode} "
+        f"target_anchor={target_anchor} strict_entry_fill={strict_entry_fill}"
     )
     print(f"Signals generated (MTF-approved): {result.total_signals_generated}")
     print(f"Rejected by MTF confluence:       {result.total_mtf_rejected}")
@@ -263,6 +347,69 @@ def run_mtf_gated_backtest(
             print(f"   {err}")
 
     return result
+
+
+# =====================================================================
+# Output helpers
+# =====================================================================
+
+def _signal_time(df_5m: pd.DataFrame, trade):
+    """
+    Timestamp of the bar where the signal was registered (the break
+    bar), or None if it cannot be determined.
+    """
+
+    bar_index = getattr(trade.signal, "bar_index", None)
+
+    try:
+        return df_5m.index[int(bar_index)]
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def build_trade_rows(result, df_5m: pd.DataFrame, df_enriched: pd.DataFrame):
+    """
+    One row per closed trade, tagged with the 1H macro and 15M internal
+    trend at signal time. The tags are for reporting only.
+    """
+
+    tag_fn = build_mtf_tag_fn(df_enriched)
+
+    closed = [t for t in result.trades if t.result_status in {"WIN", "LOSS"}]
+
+    rows = []
+
+    for t in closed:
+
+        signal_ts = _signal_time(df_5m, t)
+
+        if signal_ts is not None:
+            macro_tag, internal_tag = tag_fn(signal_ts)
+        else:
+            macro_tag, internal_tag = None, None
+
+        rows.append(
+            {
+                "setup_time": t.setup_time,
+                "signal_time": signal_ts,
+                "entry_time": t.entry_time,
+                "exit_time": t.exit_time,
+                "direction": getattr(t.direction, "value", t.direction),
+                "macro_trend_at_signal": macro_tag,
+                "internal_trend_at_signal": internal_tag,
+                "entry_price": t.fill_price,
+                "exit_price": t.exit_price,
+                "stop_loss": t.stop_loss,
+                "take_profit": t.take_profit,
+                "initial_risk": t.initial_risk,
+                "result_status": t.result_status,
+                "r_multiple": t.r_multiple,
+                "bars_held": t.bars_held,
+                "session": t.session,
+            }
+        )
+
+    return rows
 
 
 # =====================================================================
@@ -284,13 +431,23 @@ def main():
     parser.add_argument(
         "--output",
         default=None,
-        help="Optional path for saving closed trades as CSV.",
+        help="Optional path for saving closed trades (with 1H/15M trend tags) as CSV.",
     )
 
     parser.add_argument(
         "--no-mtf-neutral",
         action="store_true",
         help="Reject signals when internal (15M) trend is neutral, instead of allowing them.",
+    )
+
+    parser.add_argument(
+        "--no-direction-gate",
+        action="store_true",
+        help=(
+            "Do not require the 1H/15M trend to agree with the trade "
+            "direction (counter-trend entries allowed). Trends are "
+            "still written as tags in --output."
+        ),
     )
 
     parser.add_argument(
@@ -314,6 +471,39 @@ def main():
         help="Total round-trip commission in price units. Default 0.0.",
     )
 
+    parser.add_argument(
+        "--reward-multiple",
+        type=float,
+        default=2.0,
+        help="Target as a multiple of risk (default 2.0, the original fixed target).",
+    )
+
+    parser.add_argument(
+        "--fill-mode",
+        choices=["touch", "market_on_close"],
+        default="touch",
+        help=(
+            "touch (default): fill on zone-edge touch. "
+            "market_on_close: trigger on touch, fill at the next bar's open."
+        ),
+    )
+
+    parser.add_argument(
+        "--target-anchor",
+        choices=["zone", "fill"],
+        default="zone",
+        help=(
+            "zone (default): target stays where the zone-midpoint entry put it. "
+            "fill: target = reward-multiple x real risk (requires --fill-mode market_on_close)."
+        ),
+    )
+
+    parser.add_argument(
+        "--strict-entry-fill",
+        action="store_true",
+        help="Fill only if price actually reaches the entry (cannot combine with market_on_close).",
+    )
+
     args = parser.parse_args()
 
     start_time = time.perf_counter()
@@ -327,6 +517,13 @@ def main():
         print("\n1. Loading raw 5M OHLC dataset...")
         df_5m = load_5m_data(args.data)
 
+        check_cost_scale(
+            df_5m,
+            spread=args.spread,
+            slippage=args.slippage,
+            commission=args.commission,
+        )
+
         print("\n2. Building 1H macro and 15M internal structure...")
         df_enriched = build_mtf_context(df_5m)
 
@@ -338,27 +535,15 @@ def main():
             spread=args.spread,
             slippage=args.slippage,
             commission=args.commission,
+            gate_direction=not args.no_direction_gate,
+            reward_multiple=args.reward_multiple,
+            fill_mode=args.fill_mode,
+            target_anchor=args.target_anchor,
+            strict_entry_fill=args.strict_entry_fill,
         )
 
         if args.output:
-            closed = [t for t in result.trades if t.result_status in {"WIN", "LOSS"}]
-            rows = [
-                {
-                    "setup_time": t.setup_time,
-                    "entry_time": t.entry_time,
-                    "exit_time": t.exit_time,
-                    "direction": getattr(t.direction, "value", t.direction),
-                    "entry_price": t.fill_price,
-                    "exit_price": t.exit_price,
-                    "stop_loss": t.stop_loss,
-                    "take_profit": t.take_profit,
-                    "result_status": t.result_status,
-                    "r_multiple": t.r_multiple,
-                    "bars_held": t.bars_held,
-                    "session": t.session,
-                }
-                for t in closed
-            ]
+            rows = build_trade_rows(result, df_5m, df_enriched)
             pd.DataFrame(rows).to_csv(args.output, index=False)
             print(f"\nSaved {len(rows)} closed trade(s) to {args.output}")
 
