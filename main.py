@@ -33,6 +33,7 @@ The strategy engines remain responsible for:
     - Retest / trigger / exit lifecycle
     - MTF structure
     - MTF confluence
+    - Structural targets (strategy/structure_targets.py)
 
 run_backtest() accepts an optional mtf_filter_fn hook: when None it
 behaves exactly as in every existing test. When provided, only
@@ -63,10 +64,20 @@ meaningless.
 
 Exit / fill options
 -------------------
---reward-multiple, --fill-mode, --target-anchor and
---strict-entry-fill are passed straight through to run_backtest().
+--reward-multiple, --fill-mode, --target-anchor, --strict-entry-fill
+and --stop-atr-mult are passed straight through to run_backtest().
 Defaults equal run_backtest()'s own defaults, so omitting them
 reproduces the previous results exactly.
+
+--target-anchor structure uses the nearest CONFIRMED 15M swing as the
+target (see strategy/structure_targets.py). It needs --fill-mode
+market_on_close. --min-rr (default 1.5) is the minimum reward to that
+swing; trades below it are skipped, or with --advance-to-min-rr the
+next swing that reaches it is used instead.
+
+--stop-atr-mult widens the stop beyond the zone edge by that multiple
+of the causal ATR(14) known at the fill bar's open. It needs
+--fill-mode market_on_close.
 """
 
 import argparse
@@ -80,6 +91,10 @@ import pandas as pd
 from strategy.backtest import run_backtest
 from strategy.mtf_structure import build_mtf_dataset_with_structure
 from strategy.confluence import build_mtf_signal_filter, build_mtf_tag_fn
+from strategy.structure_targets import (
+    StructureTargetConfig,
+    build_structure_target_fn,
+)
 from strategy.swings import find_swings
 from dashboard.mtf_context import MTFConfig
 
@@ -93,6 +108,9 @@ REQUIRED_OHLC_COLUMNS = {"open", "high", "low", "close"}
 # Multi-timeframe settings (one place to change them)
 MTF_MACRO_TF = "1h"
 MTF_INTERNAL_TF = "15min"
+
+# Minimum reward to the structural target, in R (spec value).
+DEFAULT_MIN_RR = 1.5
 
 # Costs may not exceed this fraction of the median 5M candle range.
 # Real gold: median range ~4.35, a 0.50 cost is ~0.11 of it -- fine.
@@ -270,6 +288,8 @@ def run_mtf_gated_backtest(
     fill_mode: str = "touch",
     target_anchor: str = "zone",
     strict_entry_fill: bool = False,
+    target_fn=None,
+    stop_atr_mult: float = 0.0,
 ):
     """
     Run the SAME tested run_backtest() engine used by Phase 1/2/3,
@@ -288,9 +308,9 @@ def run_mtf_gated_backtest(
     gate_direction=False removes the 1H/15M trend-direction
     requirement (counter-trend entries allowed).
 
-    reward_multiple, fill_mode, target_anchor and strict_entry_fill
-    are passed straight through to run_backtest(); defaults equal
-    run_backtest()'s own defaults.
+    reward_multiple, fill_mode, target_anchor, strict_entry_fill,
+    target_fn and stop_atr_mult are passed straight through to
+    run_backtest(); defaults equal run_backtest()'s own defaults.
     """
 
     mtf_filter_fn = build_mtf_signal_filter(
@@ -309,6 +329,8 @@ def run_mtf_gated_backtest(
         strict_entry_fill=strict_entry_fill,
         fill_mode=fill_mode,
         target_anchor=target_anchor,
+        target_fn=target_fn,
+        stop_atr_mult=stop_atr_mult,
     )
 
     closed_count = sum(
@@ -330,7 +352,8 @@ def run_mtf_gated_backtest(
     print(
         "Exit / fill settings:             "
         f"reward={reward_multiple}R fill_mode={fill_mode} "
-        f"target_anchor={target_anchor} strict_entry_fill={strict_entry_fill}"
+        f"target_anchor={target_anchor} strict_entry_fill={strict_entry_fill} "
+        f"stop_atr_mult={stop_atr_mult}"
     )
     print(f"Signals generated (MTF-approved): {result.total_signals_generated}")
     print(f"Rejected by MTF confluence:       {result.total_mtf_rejected}")
@@ -388,6 +411,11 @@ def build_trade_rows(result, df_5m: pd.DataFrame, df_enriched: pd.DataFrame):
         else:
             macro_tag, internal_tag = None, None
 
+        if t.initial_risk > 0:
+            planned_rr = abs(t.take_profit - t.fill_price) / t.initial_risk
+        else:
+            planned_rr = None
+
         rows.append(
             {
                 "setup_time": t.setup_time,
@@ -402,6 +430,7 @@ def build_trade_rows(result, df_5m: pd.DataFrame, df_enriched: pd.DataFrame):
                 "stop_loss": t.stop_loss,
                 "take_profit": t.take_profit,
                 "initial_risk": t.initial_risk,
+                "planned_rr": planned_rr,
                 "result_status": t.result_status,
                 "r_multiple": t.r_multiple,
                 "bars_held": t.bars_held,
@@ -490,11 +519,43 @@ def main():
 
     parser.add_argument(
         "--target-anchor",
-        choices=["zone", "fill"],
+        choices=["zone", "fill", "structure"],
         default="zone",
         help=(
             "zone (default): target stays where the zone-midpoint entry put it. "
-            "fill: target = reward-multiple x real risk (requires --fill-mode market_on_close)."
+            "fill: target = reward-multiple x real risk. "
+            "structure: target = nearest confirmed 15M swing (see --min-rr). "
+            "fill and structure require --fill-mode market_on_close."
+        ),
+    )
+
+    parser.add_argument(
+        "--min-rr",
+        type=float,
+        default=None,
+        help=(
+            f"With --target-anchor structure: minimum reward to the 15M swing, "
+            f"in R (default {DEFAULT_MIN_RR}). Trades below it are skipped."
+        ),
+    )
+
+    parser.add_argument(
+        "--advance-to-min-rr",
+        action="store_true",
+        help=(
+            "With --target-anchor structure: instead of skipping a trade whose "
+            "nearest swing is below --min-rr, use the nearest swing that reaches it."
+        ),
+    )
+
+    parser.add_argument(
+        "--stop-atr-mult",
+        type=float,
+        default=0.0,
+        help=(
+            "Widen the stop beyond the zone edge by this multiple of the "
+            "causal ATR(14) known at the fill bar's open. Default 0.0 (off). "
+            "Requires --fill-mode market_on_close."
         ),
     )
 
@@ -505,6 +566,29 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Fail fast, before the expensive MTF build.
+    if args.target_anchor != "zone" and args.fill_mode != "market_on_close":
+        parser.error("--target-anchor fill/structure requires --fill-mode market_on_close")
+
+    if args.stop_atr_mult < 0:
+        parser.error("--stop-atr-mult must be >= 0")
+
+    if args.stop_atr_mult > 0 and args.fill_mode != "market_on_close":
+        parser.error("--stop-atr-mult > 0 requires --fill-mode market_on_close")
+
+    if args.strict_entry_fill and args.fill_mode == "market_on_close":
+        parser.error("--strict-entry-fill cannot be combined with --fill-mode market_on_close")
+
+    if args.target_anchor != "structure" and (
+        args.min_rr is not None or args.advance_to_min_rr
+    ):
+        parser.error("--min-rr and --advance-to-min-rr only apply with --target-anchor structure")
+
+    if args.min_rr is not None and args.min_rr <= 0:
+        parser.error("--min-rr must be > 0")
+
+    min_rr = args.min_rr if args.min_rr is not None else DEFAULT_MIN_RR
 
     start_time = time.perf_counter()
 
@@ -524,6 +608,22 @@ def main():
             commission=args.commission,
         )
 
+        target_fn = None
+        if args.target_anchor == "structure":
+            target_fn = build_structure_target_fn(
+                df_5m,
+                tf=MTF_INTERNAL_TF,
+                config=StructureTargetConfig(
+                    min_rr=min_rr,
+                    advance_to_min_rr=args.advance_to_min_rr,
+                ),
+            )
+            print(
+                f"   Structural target: nearest confirmed {MTF_INTERNAL_TF} swing, "
+                f"min {min_rr}R, "
+                f"{'advance to next swing' if args.advance_to_min_rr else 'skip if below min'}."
+            )
+
         print("\n2. Building 1H macro and 15M internal structure...")
         df_enriched = build_mtf_context(df_5m)
 
@@ -540,6 +640,8 @@ def main():
             fill_mode=args.fill_mode,
             target_anchor=args.target_anchor,
             strict_entry_fill=args.strict_entry_fill,
+            target_fn=target_fn,
+            stop_atr_mult=args.stop_atr_mult,
         )
 
         if args.output:
