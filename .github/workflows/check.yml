@@ -10,7 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       PYTHONPATH: .
     steps:
@@ -144,3 +144,8 @@ jobs:
         run: |
           git grep -n "mark_history_loaded" -- phase_04_live
           git grep -q "mark_history_loaded" -- phase_04_live/runtime/loop.py || { echo "NOT CALLED in loop.py"; exit 1; }
+
+      - name: 12. MTF split and reward sweep (market on close)
+        if: always()
+        continue-on-error: true
+        run: python tools/mtf_split.py --data data/real_gold_data_5m.csv --rows 40000
