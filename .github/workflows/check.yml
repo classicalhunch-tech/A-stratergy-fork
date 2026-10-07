@@ -29,9 +29,13 @@ jobs:
           grep -nE 'MTF_MACRO_TF|MTF_INTERNAL_TF' main.py || echo "main.py is the OLD version (default 4h macro)"
           python main.py --data data/master_historical_data.csv
 
-      - name: 1b. Backtest with gold-sized costs (information only)
-        continue-on-error: true
-        run: python main.py --data data/master_historical_data.csv --spread 0.30 --slippage 0.10
+      - name: 1b. Cost-scale guard must refuse gold-sized costs on EURUSD-scale data
+        run: |
+          if python main.py --data data/master_historical_data.csv --spread 0.30 --slippage 0.10; then
+            echo "ERROR: the cost-scale guard did not refuse. Gold-sized costs on EURUSD-scale data give meaningless R numbers."
+            exit 1
+          fi
+          echo "guard refused as expected"
 
       - name: 1c. Price range of the CSV (is it gold-sized?)
         continue-on-error: true
@@ -43,7 +47,7 @@ jobs:
           print("median 5m range:", float((df["high"] - df["low"]).median()))
           EOF
 
-      - name: 1d. Backtest — real gold data with real costs
+      - name: 1d. Backtest — real gold data with real costs (baseline, direction gate ON)
         continue-on-error: true
         run: |
           python main.py --data data/real_gold_data_5m.csv \
@@ -154,3 +158,96 @@ jobs:
         if: always()
         continue-on-error: true
         run: python tools/pattern_report.py --data data/real_gold_data_5m.csv --rows 40000
+
+  # ---------------------------------------------------------------
+  # Experiments: direction gate ON vs OFF at 2R / 3R / 5R.
+  # Manual only (Actions -> check -> Run workflow). 6 parallel jobs,
+  # ~13 minutes each, so ~80 runner-minutes per manual run.
+  # Fill mode is "touch" (the engine default), the same as step 1d.
+  # Market-on-close results are already printed by steps 12 and 13.
+  # ---------------------------------------------------------------
+  experiments:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: .
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: ["on", "off"]
+        reward: [2.0, 3.0, 5.0]
+    name: experiments (gate ${{ matrix.gate }}, reward ${{ matrix.reward }}R)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Backtest, real gold data, real costs
+        continue-on-error: true
+        run: |
+          FLAG=""
+          if [ "${{ matrix.gate }}" = "off" ]; then FLAG="--no-direction-gate"; fi
+          python main.py --data data/real_gold_data_5m.csv \
+                         --spread 0.30 --slippage 0.10 --commission 0.0 \
+                         --reward-multiple ${{ matrix.reward }} $FLAG \
+                         --output trades.csv
+
+      - name: Results split by 1H / 15M trend at signal time (net of costs)
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+
+          df = pd.read_csv("trades.csv")
+          if df.empty:
+              raise SystemExit("no closed trades")
+
+          print("directions seen:", sorted(df["direction"].astype(str).unique()))
+
+          def tag(row):
+              d = str(row["direction"]).upper()
+              if "LONG" in d:
+                  want = "BULLISH"
+              elif "SHORT" in d:
+                  want = "BEARISH"
+              else:
+                  return "unknown"
+              m = str(row["macro_trend_at_signal"]).upper()
+              i = str(row["internal_trend_at_signal"]).upper()
+              m_ok = m == want
+              i_ok = i == want
+              if m not in ("BULLISH", "BEARISH") and i not in ("BULLISH", "BEARISH"):
+                  return "unknown"
+              if m_ok and i_ok:
+                  return "both_agree"
+              if m_ok:
+                  return "macro_only_agrees"
+              if i_ok:
+                  return "internal_only_agrees"
+              return "against_both"
+
+          df["tag"] = df.apply(tag, axis=1)
+
+          rows = []
+          for name, g in [("ALL", df)] + list(df.groupby("tag")):
+              n = len(g)
+              r = g["r_multiple"]
+              se = r.std(ddof=1) / (n ** 0.5) if n > 1 else float("nan")
+              rows.append({
+                  "group": name,
+                  "trades": n,
+                  "win_pct": round(100 * (g["result_status"] == "WIN").mean(), 1),
+                  "net_R": round(r.mean(), 3),
+                  "SE": round(se, 3),
+              })
+
+          print(pd.DataFrame(rows).to_string(index=False))
+          print("net_R is after costs. A group is not distinguishable from zero")
+          print("unless |net_R| is well above 2 x SE. Under 20 trades = noise.")
+          EOF
