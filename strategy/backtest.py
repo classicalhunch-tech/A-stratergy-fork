@@ -114,6 +114,38 @@ def _market_fill_is_valid(
     return False
 
 
+def _fill_anchored_target(
+    direction: SignalType,
+    fill_price: float,
+    stop_loss: float,
+    reward_multiple: float,
+) -> Optional[float]:
+    """
+    Target placed at reward_multiple x the REAL risk (fill to stop),
+    instead of the zone-midpoint risk the signal was built with.
+
+    Returns None when the fill is not on the correct side of the stop
+    (the order could not exist live).
+    """
+
+    risk = abs(fill_price - stop_loss)
+
+    if risk <= EPSILON:
+        return None
+
+    if direction == SignalType.LONG:
+        if fill_price <= stop_loss + EPSILON:
+            return None
+        return fill_price + risk * reward_multiple
+
+    if direction == SignalType.SHORT:
+        if fill_price >= stop_loss - EPSILON:
+            return None
+        return fill_price - risk * reward_multiple
+
+    return None
+
+
 def _entry_bar_exit(
     direction: SignalType,
     stop_loss: float,
@@ -454,6 +486,7 @@ def run_backtest(
     commission: float = 0.0,
     strict_entry_fill: bool = False,
     fill_mode: str = "touch",
+    target_anchor: str = "zone",
 ) -> BacktestResult:
     """
     fill_mode:
@@ -463,6 +496,14 @@ def run_backtest(
             bar t, and the market order fills at the OPEN of bar t+1.
             Mirrors what the live bot does (one fresh tick after a
             closed candle triggers the signal).
+
+    target_anchor (only with fill_mode="market_on_close"):
+        "zone" (default) -- take profit stays where the zone-midpoint
+            entry put it (the original behaviour).
+        "fill" -- take profit is recomputed as reward_multiple x the
+            real risk (fill price to stop), so reward:risk is what
+            reward_multiple says even when the fill is far from the
+            midpoint.
     """
 
     if df is None:
@@ -500,6 +541,16 @@ def run_backtest(
     if fill_mode == "market_on_close" and strict_entry_fill:
         raise ValueError(
             "strict_entry_fill cannot be combined with market_on_close"
+        )
+
+    if target_anchor not in {"zone", "fill"}:
+        raise ValueError(
+            "target_anchor must be 'zone' or 'fill'"
+        )
+
+    if target_anchor == "fill" and fill_mode != "market_on_close":
+        raise ValueError(
+            "target_anchor='fill' requires fill_mode='market_on_close'"
         )
 
     round_trip_cost = spread + (2.0 * slippage) + commission
@@ -564,13 +615,32 @@ def run_backtest(
 
                 fill_price = current_open
                 stop = float(signal.stop_loss)
-                target = float(signal.take_profit)
 
-                if not _market_fill_is_valid(
-                    signal.signal_type, fill_price, stop, target
-                ):
-                    total_invalidated += 1
-                    continue
+                if target_anchor == "fill":
+
+                    anchored = _fill_anchored_target(
+                        signal.signal_type,
+                        fill_price,
+                        stop,
+                        reward_multiple,
+                    )
+
+                    if anchored is None:
+                        total_invalidated += 1
+                        continue
+
+                    target = float(anchored)
+                    signal.take_profit = target
+
+                else:
+
+                    target = float(signal.take_profit)
+
+                    if not _market_fill_is_valid(
+                        signal.signal_type, fill_price, stop, target
+                    ):
+                        total_invalidated += 1
+                        continue
 
                 signal.entry_price = float(fill_price)
                 signal.recalculate_risk_reward()
