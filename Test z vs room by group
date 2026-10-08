@@ -1,0 +1,103 @@
+import math
+
+import pandas as pd
+import pytest
+
+from tools import z_vs_room as zr
+from tools import z_vs_room_by_group as bg
+
+
+def trade(net, z, room, quarter="2026Q1", direction="LONG"):
+    return {
+        "net": net, "z": z, "room": room, "win": net > 0,
+        "quarter": quarter, "direction": direction, "window": "head",
+    }
+
+
+def test_sign_tally_exact_binomial():
+    k, m, p = bg.sign_tally([1, 1, 1, 1, -1])
+    assert (k, m) == (4, 5)
+    assert p == pytest.approx(12 / 32)
+
+    # all one way: p = 2 / 2**m
+    k, m, p = bg.sign_tally([1, 2, 3, 4, 5, 6])
+    assert (k, m) == (6, 6) and p == pytest.approx(2 / 64)
+
+    # NaN and exact zeros are ignored
+    k, m, p = bg.sign_tally([float("nan"), 0.0, -1.0, 1.0])
+    assert (k, m) == (1, 2) and p == 1.0
+
+    k, m, p = bg.sign_tally([float("nan")])
+    assert m == 0 and p != p
+
+
+def test_group_trades_sorted_and_missing_key():
+    ts = [trade(1, True, 2.0, quarter="2026Q2"), trade(1, True, 2.0, quarter="2025Q4"),
+          {"net": 0, "z": False, "room": None, "win": False}]
+
+    names = [g for g, _ in bg.group_trades(ts, "quarter")]
+
+    assert names == ["2025Q4", "2026Q2", "UNKNOWN"]
+
+
+def test_small_cells_give_no_difference_but_big_cells_do():
+    # Z/pass has only 3 trades -> no Welch difference involving it at min_cell 8
+    small = (
+        [trade(1.0, True, 3.0)] * 2 + [trade(-1.0, True, 3.0)]
+        + [trade(float(i % 3), False, 3.0) for i in range(12)]
+        + [trade(float(i % 3), False, 0.5) for i in range(12)]
+    )
+
+    s = bg.summarize_group(small, 1.5, min_cell=8, min_pooled=30)
+
+    assert s["pass_minus_fail"][0] == s["pass_minus_fail"][0]  # 15 vs 12: fine
+    assert s["z_minus_nz"][0] != s["z_minus_nz"][0]            # Z has 3 trades
+    assert s["pooled"] is None                                  # 27 < 30
+
+
+def test_pooled_only_when_group_big_enough():
+    ts = [
+        trade(0.2 * (i % 5) - 0.3, i % 2 == 0, 3.0 if i % 3 else 0.5)
+        for i in range(60)
+    ]
+
+    assert bg.summarize_group(ts, 1.5, min_pooled=30)["pooled"] is not None
+    assert bg.summarize_group(ts, 1.5, min_pooled=61)["pooled"] is None
+
+
+def test_rows_from_csv_roundtrip(tmp_path):
+    df = pd.DataFrame(
+        {
+            "label": ["Z_against_both", "A_counter_trend"],
+            "direction": ["LONG", "SHORT"],
+            "entry_time": ["2026-01-05 12:00:00+00:00", "2026-04-06 09:30:00+00:00"],
+            "quarter": ["2026Q1", "2026Q2"],
+            "risk": [2.0, 3.0],
+            "run_r": [2.5, 0.4],
+            "stopped": [False, True],
+            "room_r": [3.2, float("nan")],
+            "window": ["head", "tail"],
+        }
+    )
+    path = tmp_path / "t.csv"
+    df.to_csv(path, index=False)
+
+    rows = bg.rows_from_csv(path)
+
+    assert rows[0]["room_r"] == pytest.approx(3.2)
+    assert rows[1]["room_r"] is None            # NaN becomes "no swing"
+    assert rows[1]["stopped"] is True
+    assert isinstance(rows[0]["entry_time"], pd.Timestamp)
+
+    out = zr.resolved_trades(rows, target=2.0, cost=0.5)
+
+    assert len(out) == 2
+    assert out[0]["quarter"] == "2026Q1" and out[1]["direction"] == "SHORT"
+
+
+def test_rows_from_csv_rejects_a_file_without_the_trade_columns(tmp_path):
+    path = tmp_path / "bad.csv"
+    pd.DataFrame({"x": [1]}).to_csv(path, index=False)
+
+    with pytest.raises(ValueError):
+        bg.rows_from_csv(path)
