@@ -97,6 +97,10 @@ def resolved_trades(rows, target, cost):
                 "win": g > 0,
                 "z": r["label"] == FOCUS,
                 "room": r["room_r"],
+                # carried through so callers can split the trades afterwards
+                "quarter": r.get("quarter"),
+                "direction": r.get("direction"),
+                "window": r.get("window"),
             }
         )
 
@@ -113,14 +117,18 @@ def cell_stats(trades):
     return n, win_pct, mean, se
 
 
-def welch_diff(a, b):
+def welch_diff(a, b, min_n=2):
     """
     Difference of two independent cell means.
     a, b: (n, win %, mean, SE). Returns (diff, SE, t); NaNs if either cell has
-    fewer than 2 trades or no spread.
+    fewer than `min_n` trades (at least 2) or no spread. A cell of 2 to 5
+    trades can have a near-zero SE by luck, which makes t meaningless, so
+    callers working with small groups should raise min_n.
     """
 
-    if a[0] < 2 or b[0] < 2 or a[3] != a[3] or b[3] != b[3]:
+    min_n = max(int(min_n), 2)
+
+    if a[0] < min_n or b[0] < min_n or a[3] != a[3] or b[3] != b[3]:
         return NAN, NAN, NAN
 
     diff = a[2] - b[2]
