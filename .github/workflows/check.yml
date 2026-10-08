@@ -394,24 +394,31 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------
-  # Z vs room by quarter and direction. Manual only.
-  # Splits the same trades the exit study uses into groups by
-  # quarter (2025Q4, 2026Q1, ...) and by direction (LONG, SHORT),
-  # then runs the Z-vs-room comparison within each group.
-  # Answers: is the sign flip in Z caused by regime (bull vs bear),
-  # by direction, or by noise?
+  # Z vs room. Manual only (Actions -> check -> Run workflow).
+  #
+  # Answers: is the edge in the Z label (against both the 1H and the
+  # 15M trend) or in the room rule (nearest 15M swing >= T x risk
+  # away)? Fixed 2R and 5R exits, T = 1, 1.5, 2, 3, 5.
+  #
+  # One job, not a head/tail matrix, on purpose:
+  #   1. tools/z_vs_room.py runs the engine once per half (head, then
+  #      tail) and writes every trade to z_vs_room_trades.csv.
+  #   2. tools/z_vs_room_by_group.py --from-csv then splits those SAME
+  #      trades by quarter and by direction in about a second, with no
+  #      second backtest. Head and tail are pooled, so a quarter that
+  #      straddles the boundary (2026Q1) is one group.
+  # The results are also printed on the run's Summary page, so nothing
+  # has to be downloaded to read them.
+  # Needs: tools/z_vs_room.py, tools/z_vs_room_by_group.py and their
+  # tests in tests/.
   # ---------------------------------------------------------------
-  z_vs_room_by_group:
+  z_vs_room:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PYTHONPATH: .
-    strategy:
-      fail-fast: false
-      matrix:
-        which: [head, tail]
-    name: z vs room by group (${{ matrix.which }})
+    name: z vs room (head and tail, then by quarter and direction)
     steps:
       - uses: actions/checkout@v4
 
@@ -422,21 +429,47 @@ jobs:
       - name: Install packages (pinned, strict)
         run: pip install -r requirements.txt
 
-      - name: Z vs room split by quarter and direction
+      - name: Z vs room, head and tail (one backtest per half)
+        run: |
+          set -o pipefail
+          python tools/z_vs_room.py \
+            --data data/real_gold_data_5m.csv \
+            --rows 40000 --which both --cost 0.5 \
+            --output z_vs_room_trades.csv \
+            | tee z_vs_room_both.txt
+
+      - name: Split by quarter and direction (reads the saved trades, no backtest)
         run: |
           set -o pipefail
           python tools/z_vs_room_by_group.py \
-            --data data/real_gold_data_5m.csv \
-            --rows 40000 \
-            --which ${{ matrix.which }} \
-            --cost 0.5 \
-            | tee z_vs_room_by_group_${{ matrix.which }}.txt
+            --from-csv z_vs_room_trades.csv --cost 0.5 \
+            | tee z_vs_room_by_group.txt
+          python tools/z_vs_room_by_group.py \
+            --from-csv z_vs_room_trades.csv --cost 0.5 --per-window --detail \
+            | tee z_vs_room_by_group_per_window.txt
+
+      - name: Show the results on the run's Summary page
+        if: always()
+        run: |
+          {
+            echo '## Z vs room: head vs tail stability'
+            echo '```'
+            sed -n '/HEAD vs TAIL/,$p' z_vs_room_both.txt 2>/dev/null || true
+            echo '```'
+            echo '## By quarter and direction (head and tail pooled)'
+            echo '```'
+            cat z_vs_room_by_group.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: z-vs-room-by-group-${{ matrix.which }}
+          name: z-vs-room
           path: |
-            z_vs_room_by_group_${{ matrix.which }}.txt
+            z_vs_room_both.txt
+            z_vs_room_by_group.txt
+            z_vs_room_by_group_per_window.txt
+            z_vs_room_trades.csv
           if-no-files-found: ignore
