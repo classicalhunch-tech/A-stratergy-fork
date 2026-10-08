@@ -346,3 +346,49 @@ jobs:
           print("net_R is after costs. A group is not distinguishable from zero")
           print("unless |net_R| is well above 2 x SE. Under 20 trades = noise.")
           EOF
+
+  # ---------------------------------------------------------------
+  # Exit study: one backtest, every exit. Manual only.
+  # Runs exit_study.py on both halves of the gold data (tail = last
+  # 40000, head = first 40000) so Z can be checked for stability
+  # across time. Output text and per-trade CSV are uploaded as
+  # artifacts.
+  # ---------------------------------------------------------------
+  exit_study:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: .
+    strategy:
+      fail-fast: false
+      matrix:
+        which: [tail, head]
+    name: exit study (${{ matrix.which }} 40000 rows)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Exit study
+        run: |
+          set -o pipefail
+          python tools/exit_study.py --data data/real_gold_data_5m.csv \
+            --rows 40000 --which ${{ matrix.which }} \
+            --output exit_study_trades_${{ matrix.which }}.csv \
+            | tee exit_study_${{ matrix.which }}.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exit-study-${{ matrix.which }}
+          path: |
+            exit_study_${{ matrix.which }}.txt
+            exit_study_trades_${{ matrix.which }}.csv
+          if-no-files-found: ignore
