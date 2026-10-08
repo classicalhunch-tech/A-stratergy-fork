@@ -3,6 +3,10 @@
 Written: 2026-10-09. Frozen from this date: do not edit the rules
 below. Only the run log changes.
 
+Pre-registration protects the result from being re-interpreted
+after the fact. The rules below define what "works" means
+before the test runs.
+
 ## Where we stand (development data)
 
 Gold 5M, 80,000 candles (head 40k + tail 40k), 2025-08-20 to
@@ -141,6 +145,16 @@ gate, cost 0.5.
 11. **Log every run.**
     Table below. The Decision column is filled in immediately
     after the run, before any further analysis.
+
+## What does not count
+
+- Re-running the same holdout with different flags.
+- Slicing the holdout by quarter, direction, or session after
+  seeing the aggregate result.
+- Treating the dev-data numbers as evidence.
+- Any result produced by a modified tool.
+- Any result where the holdout file changed after the run.
+- Any result not logged immediately.
 
 ## Run log
 
