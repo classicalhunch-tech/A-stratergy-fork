@@ -1,0 +1,150 @@
+# Z vs room: research rules
+
+Written: 2026-10-09. Frozen from this date: do not edit the rules
+below. Only the run log changes.
+
+## Where we stand (development data)
+
+Gold 5M, 80,000 candles (head 40k + tail 40k), 2025-08-20 to
+2026-10-06, 446 triggered trades, market-on-close fill, no MTF
+gate, cost 0.5.
+
+- Z (against both the 1H and the 15M trend) is unstable:
+  net -0.412R at 2R in the first 40k candles (t -2.36),
+  +0.216R in the last 40k (t +0.99), about zero pooled
+  (-0.11R at 2R, -0.02R at 5R).
+- At the measure used below (5R, room T = 1.5), the pooled Z
+  effect is -0.15R (t -0.57).
+- Room (nearest confirmed 15M swing >= 1.5R away) leans
+  positive but is below the 2.2 line: room-pass trades average
+  +0.27R (198 trades) against -0.12R for room-fail (248 trades);
+  pooled room effect +0.41R (t +1.74). It was strongest in the
+  second half and in 2026Q3.
+- About 56 to 80 comparisons were looked at, so a t of about 3.4
+  would have been needed on this data. Nothing came close.
+- The direction split shows both LONG and SHORT are negative
+  for Z at 2R (LONG -0.181, SHORT -0.063). Neither side carries
+  the edge. The sign test across directions is 0 out of 2.
+- The quarter split shows 2025Q4 negative for Z with t -2.62,
+  and the sign test across quarters is p = 1.00 at 2R (0.38 at
+  5R). No consistent direction.
+- Verdict: neither Z nor room is established. The 80k
+  development data does not confirm either. A single clean test
+  on a fresh holdout decides, using the pass, fail and
+  retirement rules below. No filters are added yet.
+
+## Rules
+
+1. **Data.**
+   The 80k gold candles are development data and are used up:
+   no more tuning on them. Any result on these candles from
+   now on is descriptive, not decisive.
+   The holdout is NEW, non-overlapping data, used in this order:
+     - More gold history first.
+     - Then EURUSD 5M at the same quality as the gold
+       development data.
+   Each holdout is looked at once, with one tool invocation,
+   one configuration. No re-slicing after seeing a result.
+
+   Holdout acceptance is by trade count, not duration. On the
+   new data alone there must be enough trades for rule 5: at
+   least 100 Z trades and at least 100 trades in each room
+   group (pass and fail). On gold the development rate was about
+   33 trades a month and 7 Z trades a month, so 100 Z trades
+   takes about 14 months. Therefore:
+     - Gold: at least 3 years of new 5M history.
+     - EURUSD: at least 24 months of 5M history at the same
+       quality. If it still gives fewer than 100 Z trades, the
+       result is INCONCLUSIVE (rule 6): no decision, it does not
+       count under rule 10, and it is only ever pooled with
+       later new data, never re-run alone.
+
+2. **Frozen setup.**
+   Market-on-close fill, no MTF gate, current stop (no ATR
+   widening), cost 0.5 on gold (for other symbols use the
+   round-trip cost in that symbol's price units). The touch-fill
+   number is never the result.
+
+3. **Measure and the one number read.**
+   Net R after cost with a fixed 5R exit. 2R is shown but
+   cannot decide anything.
+   Run once:
+     python tools/z_vs_room.py --data data/<holdout>.csv
+       --rows 0 --which tail --cost <cost>
+       --output holdout_trades.csv
+   Read only the "Pooled OLS, robust SE" line in the
+   "FIXED 5R EXIT", "room threshold T = 1.5R" block. Z effect
+   answers Q1, room effect answers Q2. Everything else the tool
+   prints (2R, other thresholds) is descriptive.
+
+4. **Two questions only.**
+   - Q1: Is Z better than not-Z?
+   - Q2: Is room >= 1.5R better than room < 1.5R?
+   Use the pooled effect, which holds the other factor fixed.
+   No other splits, no other groupings, no other thresholds.
+
+5. **Pass line, on the new data alone, per question.**
+   All three must hold:
+   - the pooled effect is positive (Z better than not-Z; room
+     pass better than room fail) with t above 2.2 (not 2,
+     because there are two tests);
+   - at least 100 trades in the smaller group (Z for Q1; the
+     smaller of room pass and room fail for Q2);
+   - the run follows rules 1 to 3 exactly.
+
+6. **Result labels.** Each question gets one label per holdout,
+   decided by the numbers alone:
+   - PASS: rule 5 is met.
+   - REVERSED: the pooled effect is negative with t below -2.2
+     (significantly the wrong way). A weak negative with t
+     above -2.2 is not a reversal, it is a FAIL.
+   - FAIL: enough trades, but neither PASS nor REVERSED.
+   - INCONCLUSIVE: too few trades for rule 5.
+
+7. **Outcomes.**
+   - Z passes: keep Z as the base.
+   - Room passes, Z does not: widen to all room trades.
+   - Both pass: Z plus room.
+   - Neither passes: add no filters and revisit the entry
+     model.
+   - A REVERSED label: counts as a failed holdout for that
+     question (rule 10), and the regime question is raised:
+     collect more data before any further decision about it.
+
+8. **Filters come last.**
+   One at a time. Keep a filter only if it improves net R on
+   the development data AND the holdout, and leaves at least
+   100 trades. The 1H zone filter waits until a base has
+   passed.
+
+9. **Never.**
+   - Change these rules after seeing results.
+   - Use a holdout twice.
+   - Pick an exit or threshold because it looks best.
+   - Edit the code during the holdout phase.
+
+   Code freeze: tools/z_vs_room.py, tools/z_vs_room_by_group.py,
+   tools/exit_study.py, dashboard/mtf_context.py and everything
+   under strategy/ (the backtest, tagger, structure targets and
+   swings all change the numbers). Record the git commit hash
+   in every run-log row. If any of this changes, the rules reset
+   and all prior holdout results are void. Commit the holdout
+   CSV before running and log its file name and row count.
+
+10. **Retirement clause.**
+    Per question. If two holdouts in a row are FAIL or REVERSED
+    for the same question, that hypothesis is retired: Z as a
+    counter-trend hypothesis (Q1), or room as a rule (Q2). No
+    further tests on a retired hypothesis. PASS resets the
+    count. INCONCLUSIVE does not count either way.
+
+11. **Log every run.**
+    Table below. The Decision column is filled in immediately
+    after the run, before any further analysis.
+
+## Run log
+
+| Date | Data | Commit | Exit | Room T | Q1 Z: effect (t) | Q2 room: effect (t) | Smaller group | Label Q1 / Q2 | Decision |
+|------|------|--------|------|--------|------------------|---------------------|---------------|---------------|----------|
+| 2026-10-09 | Gold dev 80k (head 40k + tail 40k, 446 trades) | ____ | 5R | 1.5 | -0.15 (t -0.57) | +0.41 (t +1.74) | Z: 100 | n/a (dev data) | Dev data used up, descriptive only. Neither confirmed. Move to holdout. |
+|      |      |      |      |        |                  |                     |               |               |          |
