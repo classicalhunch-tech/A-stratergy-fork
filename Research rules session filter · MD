@@ -28,7 +28,7 @@ Reason, stated before testing: the overlap has the most liquidity and the most s
 
 - Fill mode: market on close (touch, then fill at next bar's open). Touch fill is NOT used.
 - No MTF gate, no ATR widening.
-- **Decision exit: fixed 2R.** The structural 15M target is reported as a sensitivity result only and cannot change the decision.
+- **Decision exit: fixed 2R, target measured from the actual fill price (target_anchor=fill).** The structural 15M target is reported as a sensitivity result only and cannot change the decision.
 - Trade pool: ALL trades from the frozen setup, regardless of Z/A/B/X tag.
 - Frozen files: strategy/backtest.py, signals.py, retest_engine.py, structure_targets.py, swings.py, zones.py, liquidity.py, mtf_structure.py, dashboard/mtf_context.py, requirements.txt, and every tool used for this test.
 - Freeze starts when the first holdout file is committed.
@@ -67,9 +67,9 @@ Reason, stated before testing: the overlap has the most liquidity and the most s
 
 - Basis: SD of R about 1.5, difference 0.30R, 80% power, one-sided 5%.
 - **N* = 310 trades per group** (after de-duplication).
-- Before commit, check the real SD of R and the clustering effect on dev data. If they change the number materially, update N* here before commit.
+- SD of R check (done): about 1.44 at fill 2R (SE 0.094 on 234 trades in the CI log). The 1.5 assumption holds. The clustering effect of de-duplication is still to be checked.
 - **Feasibility check (fill before commit):**
-  - Ungated trades per year on gold, dev data: ____
+  - Ungated trades per year on gold, dev data: about 370 (203 to 234 closed trades in the latest 40,000 candles, roughly 6.7 months, market on close, no gate; de-duplication will lower this)
   - Share of trades that fall in-window, dev data: ____
   - Total trades needed = 310 / in-window share = ____
   - Years of basket history needed = ____
