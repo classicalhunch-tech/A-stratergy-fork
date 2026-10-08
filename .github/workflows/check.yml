@@ -392,3 +392,51 @@ jobs:
             exit_study_${{ matrix.which }}.txt
             exit_study_trades_${{ matrix.which }}.csv
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # Z vs room by quarter and direction. Manual only.
+  # Splits the same trades the exit study uses into groups by
+  # quarter (2025Q4, 2026Q1, ...) and by direction (LONG, SHORT),
+  # then runs the Z-vs-room comparison within each group.
+  # Answers: is the sign flip in Z caused by regime (bull vs bear),
+  # by direction, or by noise?
+  # ---------------------------------------------------------------
+  z_vs_room_by_group:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: .
+    strategy:
+      fail-fast: false
+      matrix:
+        which: [head, tail]
+    name: z vs room by group (${{ matrix.which }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Z vs room split by quarter and direction
+        run: |
+          set -o pipefail
+          python tools/z_vs_room_by_group.py \
+            --data data/real_gold_data_5m.csv \
+            --rows 40000 \
+            --which ${{ matrix.which }} \
+            --cost 0.5 \
+            | tee z_vs_room_by_group_${{ matrix.which }}.txt
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: z-vs-room-by-group-${{ matrix.which }}
+          path: |
+            z_vs_room_by_group_${{ matrix.which }}.txt
+          if-no-files-found: ignore
