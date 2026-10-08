@@ -1,0 +1,347 @@
+"""
+tools/session_vs_outside.py
+
+Pre-registered test H-S1 (see RESEARCH_RULES_SESSION_FILTER.md):
+do trades filled in the 13:00-17:00 UTC window have a higher mean net R
+than trades filled outside it?
+
+Frozen setup, copied from tools/structure_target_report.py:
+  market-on-close fill, no MTF gate, fixed 2R measured from the fill price.
+Cost is applied after the fact (the backtest runs at zero cost).
+
+Two modes:
+  --sizing-only   Counts, trades per year, in-window share, SD of net R.
+                  Never prints a group mean or the coefficient, so it is
+                  safe to run on development data.
+  (default)       The decision run. Prints only the section 6 numbers.
+                  Refuses to run on gold development data unless
+                  --exploratory is given. Refuses to print the coefficient
+                  until the smaller group has N* trades (no peeking),
+                  unless --exploratory is given.
+
+Window classification uses the FILL time (entry_time) in UTC.
+De-duplication: one trade per symbol, UTC calendar day and direction
+(the first one by fill time).
+
+Dataset spec:  --dataset "NAME,PATH,COSTSPEC"   (repeat for each symbol)
+  COSTSPEC  fixed:0.5      cost is 0.5 price units
+            range          cost is 0.115 x median 5M candle range of the file
+            scaled:REF     cost is 0.5 x (median close of the file / REF)
+"""
+
+import argparse
+import math
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+WINDOW_START_HOUR = 13
+WINDOW_END_HOUR = 17
+N_STAR = 310
+SWE = 0.30
+Z80 = 1.2815515655446004
+Z90 = 1.6448536269514722
+RANGE_COST_SHARE = 0.115
+GOLD_BASE_COST = 0.5
+DEV_START = pd.Timestamp("2025-08-20 12:00", tz="UTC")
+DEV_END = pd.Timestamp("2026-10-06 17:45", tz="UTC")
+
+
+# ---------------------------------------------------------------- helpers
+
+def as_utc(ts):
+    """Timestamp as UTC. A timestamp with no timezone is taken to be UTC."""
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def in_window(ts):
+    """True for 13:00 <= time < 17:00 UTC, Monday to Friday."""
+    ts = as_utc(ts)
+    if ts.dayofweek >= 5:
+        return False
+    return WINDOW_START_HOUR <= ts.hour < WINDOW_END_HOUR
+
+
+def cost_from_spec(spec, df):
+    kind, _, arg = spec.partition(":")
+    if kind == "fixed":
+        return float(arg)
+    if kind == "range":
+        return RANGE_COST_SHARE * float((df["high"] - df["low"]).median())
+    if kind == "scaled":
+        return GOLD_BASE_COST * float(df["close"].median()) / float(arg)
+    raise ValueError(f"unknown cost spec: {spec!r}")
+
+
+def dedupe(rows):
+    """Keep the first trade (by fill time) per symbol, UTC day and direction."""
+    seen = set()
+    kept = []
+    for row in sorted(rows, key=lambda r: as_utc(r["entry_time"])):
+        ts = as_utc(row["entry_time"])
+        key = (row["symbol"], ts.date(), str(row["direction"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(row)
+    return kept
+
+
+def ols_cluster(y, X, clusters):
+    """OLS with cluster-robust (CR1) standard errors. Returns (beta, se)."""
+    y = np.asarray(y, dtype=float)
+    X = np.asarray(X, dtype=float)
+    n, k = X.shape
+    try:
+        inv = np.linalg.inv(X.T @ X)
+    except np.linalg.LinAlgError:
+        return None
+    beta = inv @ (X.T @ y)
+    resid = y - X @ beta
+    _, labels = np.unique(np.asarray(list(clusters), dtype=str), return_inverse=True)
+    g = int(labels.max()) + 1
+    if g < 2 or n <= k:
+        return beta, np.full(k, float("nan"))
+    meat = np.zeros((k, k))
+    for c in range(g):
+        mask = labels == c
+        s = X[mask].T @ resid[mask]
+        meat += np.outer(s, s)
+    scale = (g / (g - 1)) * ((n - 1) / (n - k))
+    var = scale * (inv @ meat @ inv)
+    return beta, np.sqrt(np.clip(np.diag(var), 0.0, None))
+
+
+def build_design(rows):
+    """y, X (const, in_window, symbol dummies), cluster ids (UTC day)."""
+    symbols = sorted({r["symbol"] for r in rows})
+    y, X, clusters = [], [], []
+    for r in rows:
+        line = [1.0, 1.0 if r["in_window"] else 0.0]
+        line += [1.0 if r["symbol"] == s else 0.0 for s in symbols[1:]]
+        X.append(line)
+        y.append(r["net_r"])
+        clusters.append(str(as_utc(r["entry_time"]).date()))
+    return np.array(y), np.array(X), clusters
+
+
+def fit_window_effect(rows):
+    y, X, clusters = build_design(rows)
+    return ols_cluster(y, X, clusters)
+
+
+def load_ohlc(path):
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    df = df[df.index.notna()].sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    return df[["open", "high", "low", "close"]].astype(float).dropna()
+
+
+def reopen_times(df, top=3):
+    """Most common first-candle times after a gap longer than 24h (UTC)."""
+    idx = df.index
+    gaps = idx.to_series().diff()
+    firsts = idx[(gaps > pd.Timedelta(hours=24)).to_numpy()]
+    labels = [as_utc(t).strftime("%H:%M") for t in firsts]
+    return Counter(labels).most_common(top)
+
+
+def collect_trades(name, df, cost):
+    from strategy.backtest import run_backtest  # heavy import kept lazy
+
+    result = run_backtest(
+        df,
+        reward_multiple=2.0,
+        mtf_filter_fn=lambda signal, current_time: True,
+        fill_mode="market_on_close",
+        target_anchor="fill",
+    )
+    rows = []
+    for t in result.trades:
+        if t.result_status not in ("WIN", "LOSS") or t.initial_risk <= 0:
+            continue
+        ts = as_utc(t.entry_time)
+        rows.append(
+            {
+                "symbol": name,
+                "entry_time": ts,
+                "direction": str(getattr(t.direction, "value", t.direction)),
+                "net_r": float(t.r_multiple) - cost / float(t.initial_risk),
+                "in_window": in_window(ts),
+            }
+        )
+    if result.errors:
+        print(f"   WARNING: {len(result.errors)} errors; first: {result.errors[0]}")
+    return rows
+
+
+# ------------------------------------------------------------------ main
+
+def parse_dataset(text):
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            'use --dataset "NAME,PATH,COSTSPEC", e.g. "gold,data/real_gold_data_5m.csv,fixed:0.5"'
+        )
+    return parts
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", action="append", type=parse_dataset, required=True)
+    parser.add_argument("--rows", type=int, default=0, help="use only the last N candles (0 = all)")
+    parser.add_argument("--sizing-only", action="store_true")
+    parser.add_argument("--exploratory", action="store_true")
+    parser.add_argument("--cost-multiplier", type=float, default=1.0)
+    args = parser.parse_args()
+
+    started = time.perf_counter()
+    all_rows = []
+    per_symbol = {}
+    spans = {}
+
+    if args.exploratory and not args.sizing_only:
+        print("*** EXPLORATORY RUN: does not count toward any decision. Log it as exploratory. ***")
+        print()
+
+    for name, path, spec in args.dataset:
+        df = load_ohlc(Path(path))
+        if args.rows > 0:
+            df = df.tail(args.rows)
+
+        tz_note = "UTC (tz-aware file)" if df.index.tz is not None else "no timezone in file; assumed UTC"
+        first, last = as_utc(df.index[0]), as_utc(df.index[-1])
+        print(f"[{name}] {len(df)} candles {first} -> {last}")
+        print(f"[{name}] clock: {tz_note}")
+        print(f"[{name}] weekend reopen times (UTC), most common: {reopen_times(df)}")
+        print("          gold on this data reopens 22:00 or 23:00; FX typically 21:00 or 22:00")
+
+        if (
+            not args.sizing_only
+            and not args.exploratory
+            and name.lower() == "gold"
+            and first <= DEV_END
+            and last >= DEV_START
+        ):
+            print(f"[{name}] REFUSED: this file overlaps the gold development data. Use --exploratory or --sizing-only.")
+            sys.exit(2)
+
+        cost = cost_from_spec(spec, df) * args.cost_multiplier
+        print(f"[{name}] round-trip cost {cost:.6g} price units ({spec} x {args.cost_multiplier})")
+
+        rows = collect_trades(name, df, cost)
+        kept = dedupe(rows)
+        print(f"[{name}] closed trades {len(rows)}, after de-duplication {len(kept)}")
+        print()
+
+        per_symbol[name] = kept
+        spans[name] = max((last - first).days / 365.25, 1e-9)
+        all_rows.extend(kept)
+
+    n_in = sum(1 for r in all_rows if r["in_window"])
+    n_out = len(all_rows) - n_in
+    smaller = min(n_in, n_out)
+
+    print("=" * 60)
+    print("COUNTS (after de-duplication)")
+    print("=" * 60)
+    in_rate = 0.0
+    out_rate = 0.0
+    for name, kept in per_symbol.items():
+        k_in = sum(1 for r in kept if r["in_window"])
+        yrs = spans[name]
+        in_rate += k_in / yrs
+        out_rate += (len(kept) - k_in) / yrs
+        print(
+            f"  {name:10s} trades {len(kept):4d}  in-window {k_in:4d}  out {len(kept) - k_in:4d}"
+            f"  span {yrs:.2f}y  trades/yr {len(kept) / yrs:.0f}  in-window/yr {k_in / yrs:.0f}"
+        )
+    total = len(all_rows)
+    print(f"  ALL        trades {total:4d}  in-window {n_in:4d}  out {n_out:4d}")
+    if total:
+        print(f"  in-window share of trades: {n_in / total:.1%}")
+    print(f"  N* per group: {N_STAR}.  Smaller group now: {smaller}")
+
+    if args.sizing_only:
+        if total > 1:
+            vals = [r["net_r"] for r in all_rows]
+            print(f"  SD of net R (all trades, no grouping): {np.std(vals, ddof=1):.3f}")
+        smaller_rate = min(in_rate, out_rate)
+        if smaller_rate > 0:
+            print(f"  at this rate, years of data for N* in the smaller group: about {N_STAR / smaller_rate:.1f}")
+        print()
+        print("Sizing only: no group means and no coefficient are printed.")
+        print(f"Total runtime: {time.perf_counter() - started:.1f}s")
+        return
+
+    print()
+    if smaller < N_STAR and not args.exploratory:
+        print(f"NOT DECIDED: the smaller group has {smaller} of {N_STAR} trades.")
+        print("The rules allow no decision before N*, so the coefficient is not printed.")
+        print(f"Total runtime: {time.perf_counter() - started:.1f}s")
+        return
+
+    fit = fit_window_effect(all_rows)
+    if fit is None:
+        print("Cannot fit: the design matrix is singular (one group is empty).")
+        sys.exit(1)
+    beta, se = fit
+    coef, coef_se = float(beta[1]), float(se[1])
+    lo80, hi80 = coef - Z80 * coef_se, coef + Z80 * coef_se
+    lo90, hi90 = coef - Z90 * coef_se, coef + Z90 * coef_se
+    in_mean = float(np.mean([r["net_r"] for r in all_rows if r["in_window"]])) if n_in else float("nan")
+    out_mean = float(np.mean([r["net_r"] for r in all_rows if not r["in_window"]])) if n_out else float("nan")
+
+    print("=" * 60)
+    print("DECISION NUMBERS (pooled, symbol adjustment, SE clustered by UTC day)")
+    print("=" * 60)
+    print(f"  trades in / out:        {n_in} / {n_out}")
+    print(f"  coefficient (in - out): {coef:+.3f}R   SE {coef_se:.3f}")
+    print(f"  80% CI: [{lo80:+.3f}, {hi80:+.3f}]")
+    print(f"  90% CI: [{lo90:+.3f}, {hi90:+.3f}]")
+    print(f"  mean net R in-window {in_mean:+.3f}   out-of-window {out_mean:+.3f}")
+
+    if smaller < N_STAR:
+        label = "EXPLORATORY (smaller group below N*)"
+    elif lo90 > 0 and in_mean > 0:
+        label = "PASS"
+    elif hi80 < SWE:
+        label = "RULED OUT"
+    else:
+        label = "INCONCLUSIVE"
+    print(f"  label per rules: {label}")
+    print("  (the extra condition in_mean > 0 is in the label only if Amendment 1 adopts it)")
+
+    if len(per_symbol) > 1:
+        print()
+        print("Per symbol (reported, does not decide):")
+        for name, kept in per_symbol.items():
+            sub_in = sum(1 for r in kept if r["in_window"])
+            if sub_in < 2 or len(kept) - sub_in < 2:
+                print(f"  {name:10s} too few trades in one group")
+                continue
+            y, X, cl = build_design(kept)
+            res = ols_cluster(y, X, cl)
+            if res is None:
+                print(f"  {name:10s} cannot fit")
+                continue
+            print(f"  {name:10s} in {sub_in:4d} out {len(kept) - sub_in:4d}  coef {res[0][1]:+.3f}R  SE {res[1][1]:.3f}")
+
+    print()
+    print(f"Total runtime: {time.perf_counter() - started:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
