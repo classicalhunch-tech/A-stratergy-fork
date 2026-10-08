@@ -1,33 +1,40 @@
 """
 tools/z_vs_room_by_group.py
 
-Splits trades by quarter and by direction, then runs the same
-Z-vs-room analysis within each group.
+Does the Z-vs-room answer hold inside each quarter and each direction?
 
-This is a thin extension of tools/z_vs_room.py. It reuses:
-    exit_study.collect_rows        (row collection)
-    exit_study.load_ohlc           (data loading)
-    exit_study.mean_se             (mean, SE)
-    exit_study.outcome_r           (fixed-target outcome)
-    exit_study.f_r, f_se, f_t      (formatting)
-    exit_study.quarter_label       (quarter string)
-    exit_study.z_needed            (multiple-testing t threshold)
-    z_vs_room.room_passes          (room threshold test)
-    z_vs_room.resolved_trades      (net R after cost)
-    z_vs_room.cell_stats           (n, win %, mean, SE)
-    z_vs_room.welch_diff           (unpaired difference)
-    z_vs_room.pooled_effects       (OLS with robust SE)
-    z_vs_room.run_far_target       (one backtest, far target)
+A drop-in refinement of the first by-group script (same flags, plus the ones
+below). What changed and why:
 
-Run:
+  * --from-csv reads the per-trade CSV that tools/z_vs_room.py writes with
+    --output, so no backtest is re-run (a full head+tail run takes ~6.5 min).
+    The CSV holds every trade of both windows, so grouping can run over the
+    whole 80k candles at once. Head and tail do not overlap in time, so a
+    quarter that straddles the boundary (2026Q1) is one group, not two.
+  * A Welch difference is only printed when BOTH cells hold at least
+    --min-cell trades (default 8). Cells of 2 to 5 trades can have a
+    near-zero SE by luck and give a huge, meaningless t.
+  * The pooled regression is only fitted when a group has at least
+    --min-pooled trades (default 30).
+  * One compact table per split (one line per group) instead of four cell
+    blocks per group. --detail brings the cell blocks back.
+  * A sign test across the groups. The groups hold different trades, so
+    "Z beat not-Z in 5 of 6 groups" means something that one noisy t does
+    not. The p-value is exact (two-sided binomial) and still weak with few
+    groups; read it that way.
+  * The number of comparisons used for the multiple-testing note is counted,
+    not guessed.
+
+Run (fast, uses the saved trades):
+    python tools/z_vs_room_by_group.py --from-csv z_vs_room_trades.csv
+
+Run (re-runs the backtests, ~6.5 min):
     python tools/z_vs_room_by_group.py --data data/real_gold_data_5m.csv \\
         --rows 40000 --which both --cost 0.5
-
-Only the head/tail window(s) requested are run. Within each window,
-the same resolved trades are grouped by quarter and by direction.
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -38,8 +45,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools import exit_study as es       # noqa: E402
-from tools import z_vs_room as zr        # noqa: E402
+from tools import exit_study as es  # noqa: E402
+from tools import z_vs_room as zr  # noqa: E402
 
 FOCUS = es.FOCUS
 DEFAULT_COST = es.DEFAULT_COST
@@ -47,74 +54,144 @@ MIN_TRADES = es.MIN_TRADES
 
 TARGETS = [2.0, 5.0]
 THRESHOLDS = [1.5]
+MIN_CELL = 8
+MIN_POOLED = 30
+
+NAN = float("nan")
+
+CSV_REQUIRED = {
+    "label", "direction", "entry_time", "quarter",
+    "risk", "run_r", "stopped", "room_r",
+}
 
 
 # =====================================================================
-# Group reporting
+# Pure functions (tested without the engine)
 # =====================================================================
 
-def group_trades(trades, group_key):
-    """
-    Returns a list of (group_name, [trades...]) sorted by group name.
+def rows_from_csv(path):
+    """Rows in the shape tools/z_vs_room.py produces, from its --output CSV."""
 
-    group_key must be a key present on every resolved trade dict.
-    The caller adds the key (see resolved_with_group below).
-    """
+    data = pd.read_csv(path)
+
+    missing = CSV_REQUIRED - set(data.columns)
+
+    if missing:
+        raise ValueError(
+            f"{path} is missing columns {sorted(missing)}; "
+            f"write it with tools/z_vs_room.py --output"
+        )
+
+    rows = data.to_dict("records")
+
+    for r in rows:
+        r["entry_time"] = pd.Timestamp(r["entry_time"])
+        r["stopped"] = bool(r["stopped"])
+        r["room_r"] = None if r["room_r"] != r["room_r"] else float(r["room_r"])
+        r.setdefault("window", "csv")
+
+        if r["window"] != r["window"]:
+            r["window"] = "csv"
+
+    return rows
+
+
+def group_trades(trades, key):
+    """[(group name, [trades])], sorted by name. Missing key -> "UNKNOWN"."""
 
     buckets = {}
 
     for t in trades:
-        g = t.get(group_key, "UNKNOWN")
-        buckets.setdefault(g, []).append(t)
+        buckets.setdefault(t.get(key) or "UNKNOWN", []).append(t)
 
     return sorted(buckets.items(), key=lambda kv: kv[0])
 
 
-def resolved_with_group(rows, target, cost, group_key):
+def sign_tally(values):
     """
-    Like z_vs_room.resolved_trades, but keeps the group_key value on
-    each resolved trade so we can split after the fact.
+    (positives, total, two-sided exact binomial p) over the non-NaN, non-zero
+    values. Tests "positive as often as negative" across disjoint groups.
     """
 
-    out = []
+    vals = [v for v in values if v == v and v != 0]
+    m = len(vals)
 
-    for r in rows:
-        g = es.outcome_r(r["run_r"], r["stopped"], target)
+    if m == 0:
+        return 0, 0, NAN
 
-        if g is None:
-            continue
+    k = sum(1 for v in vals if v > 0)
+    tail = sum(math.comb(m, i) for i in range(0, min(k, m - k) + 1))
 
-        out.append(
-            {
-                "net": g - cost / r["risk"],
-                "win": g > 0,
-                "z": r["label"] == FOCUS,
-                "room": r["room_r"],
-                "group": r.get(group_key, "UNKNOWN"),
-            }
+    return k, m, min(1.0, 2.0 * tail / 2.0 ** m)
+
+
+def summarize_group(trades, threshold, min_cell=MIN_CELL, min_pooled=MIN_POOLED):
+    """
+    Everything the compact table needs for one group of resolved trades.
+    Diffs are NaN when a cell is under `min_cell`; pooled is None when the
+    group is under `min_pooled` or a factor never varies.
+    """
+
+    z = [t for t in trades if t["z"]]
+    nz = [t for t in trades if not t["z"]]
+    passed = [t for t in trades if zr.room_passes(t["room"], threshold)]
+    failed = [t for t in trades if not zr.room_passes(t["room"], threshold)]
+
+    s_z, s_nz = zr.cell_stats(z), zr.cell_stats(nz)
+    s_pass, s_fail = zr.cell_stats(passed), zr.cell_stats(failed)
+
+    pooled = (
+        zr.pooled_effects(trades, threshold) if len(trades) >= min_pooled else None
+    )
+
+    cells = {}
+    for zname, grp in (("Z", z), ("notZ", nz)):
+        cells[(zname, True)] = zr.cell_stats(
+            [t for t in grp if zr.room_passes(t["room"], threshold)]
+        )
+        cells[(zname, False)] = zr.cell_stats(
+            [t for t in grp if not zr.room_passes(t["room"], threshold)]
         )
 
-    return out
-
-
-def print_cells_and_diffs(trades, threshold, indent="   "):
-    """
-    Prints the four room cells and the three key Welch differences.
-    Returns the three key t-stats for the summary line.
-    """
-
-    z_all = [t for t in trades if t["z"]]
-    nz_all = [t for t in trades if not t["z"]]
-
-    cells = {
-        ("Z", True):  [t for t in z_all  if zr.room_passes(t["room"], threshold)],
-        ("Z", False): [t for t in z_all  if not zr.room_passes(t["room"], threshold)],
-        ("notZ", True):  [t for t in nz_all if zr.room_passes(t["room"], threshold)],
-        ("notZ", False): [t for t in nz_all if not zr.room_passes(t["room"], threshold)],
+    return {
+        "n": len(trades),
+        "n_z": len(z),
+        "z_net": s_z[2],
+        "nz_net": s_nz[2],
+        "z_minus_nz": zr.welch_diff(s_z, s_nz, min_n=min_cell),
+        "pass_minus_fail": zr.welch_diff(s_pass, s_fail, min_n=min_cell),
+        "pooled": pooled,
+        "cells": cells,
     }
 
-    stats = {k: zr.cell_stats(v) for k, v in cells.items()}
 
+# =====================================================================
+# Formatting
+# =====================================================================
+
+def f_diff_t(d):
+    """'+0.123 (t +1.20)' or '        n/a' when the cells were too small."""
+
+    diff, _, t = d
+
+    if diff != diff:
+        return "           n/a"
+
+    t_txt = "  n/a" if t != t else f"{t:+.2f}"
+
+    return f"{diff:+.3f} (t {t_txt})"
+
+
+def f_pooled(pooled, key):
+    if not pooled:
+        return "          n/a"
+
+    coef, se = pooled[key]
+
+    return f"{coef:+.3f} (t {es.f_t(coef, se)})"
+
+
+def print_cells(summary, indent="      "):
     order = (
         ("Z / room pass", ("Z", True)),
         ("Z / room fail", ("Z", False)),
@@ -123,134 +200,95 @@ def print_cells_and_diffs(trades, threshold, indent="   "):
     )
 
     for label, key in order:
-        n, win, mean, se = stats[key]
+        n, win, mean, se = summary["cells"][key]
+        win_txt = "  n/a" if win != win else f"{win:5.1f}"
         flag = " *" if n < MIN_TRADES else ""
         print(
-            f"{indent}{label:18s} {n:4d} {_f_n(win)}  "
+            f"{indent}{label:18s} {n:4d} {win_txt}  "
             f"{es.f_r(mean)}  {es.f_se(se)}{flag}"
         )
 
-    d_z_pass = zr.welch_diff(stats[("Z", True)], stats[("notZ", True)])
-    d_room_z = zr.welch_diff(stats[("Z", True)], stats[("Z", False)])
-    d_room_nz = zr.welch_diff(stats[("notZ", True)], stats[("notZ", False)])
+
+# =====================================================================
+# Report
+# =====================================================================
+
+def report_split(rows, key, target, cost, threshold, title, min_cell,
+                 min_pooled, detail):
+    """
+    One compact table: one line per group of `key` (quarter / direction).
+    Returns (summaries, number of t-stats shown).
+    """
+
+    trades = zr.resolved_trades(rows, target, cost)
+    groups = group_trades(trades, key)
 
     print()
-    print(f"{indent}Z pass minus notZ pass    : "
-          f"{_f_diff(d_z_pass)}")
-    print(f"{indent}room pass minus fail (Z)  : "
-          f"{_f_diff(d_room_z)}")
-    print(f"{indent}room pass minus fail (notZ): "
-          f"{_f_diff(d_room_nz)}")
-
-    return d_z_pass[2], d_room_z[2], d_room_nz[2]
-
-
-def print_summary_line(trades, threshold, t_z_pass, t_room_z, t_room_nz):
-    """
-    One line per group: Z net R with SE, pooled Z effect, pooled room
-    effect with t. This is what you scan across quarters/directions.
-    """
-
-    z_all = [t for t in trades if t["z"]]
-
-    _, _, z_mean, z_se = zr.cell_stats(z_all)
-
-    pooled = zr.pooled_effects(trades, threshold)
-
-    if pooled is None:
-        print(
-            f"   Summary: Z net {es.f_r(z_mean)} (SE {es.f_se(z_se)})  "
-            f"pooled not estimable"
-        )
-        return
-
-    zc, zs = pooled["z"]
-    rc, rs = pooled["room"]
-
-    print(
-        f"   Summary: Z net {es.f_r(z_mean)} (SE {es.f_se(z_se)})  "
-        f"pooled Z {es.f_r(zc)} (t {es.f_t(zc, zs)})  "
-        f"pooled room {es.f_r(rc)} (t {es.f_t(rc, rs)})"
-    )
-
-
-def _f_n(x):
-    return "  n/a" if x != x else f"{x:5.1f}"
-
-
-def _f_diff(d):
-    diff, se, t = d
-
-    if diff != diff:
-        return "n/a (a cell has fewer than 2 trades)"
-
-    t_txt = "n/a" if t != t else f"{t:+.2f}"
-
-    return f"{es.f_r(diff)} (SE {es.f_se(se)}, t {t_txt})"
-
-
-def report_by_group(rows, group_key, target, cost, thresholds, window, label):
-    """
-    Runs the Z-vs-room comparison within each value of group_key.
-
-    group_key: "quarter" or "direction"
-    label:     human-readable name used in headers ("QUARTER", "DIRECTION")
-    """
-
-    trades = resolved_with_group(rows, target, cost, group_key)
-    groups = group_trades(trades, "group")
-
-    print()
-    print("=" * 72)
-    print(f"[{window}] SPLIT BY {label}, fixed {target:g}R, cost {cost:g}")
-    print("=" * 72)
-    print(f"   resolved trades {len(trades)} of {len(rows)}")
+    print("=" * 100)
+    print(f"{title}: SPLIT BY {key.upper()}, fixed {target:g}R, cost {cost:g}, "
+          f"room threshold {threshold:g}R")
+    print("=" * 100)
+    print(f"   resolved trades {len(trades)} of {len(rows)}. Differences need "
+          f">= {min_cell} trades in each cell; pooled needs >= {min_pooled} "
+          f"trades in the group.")
 
     if not groups:
-        print("   (no resolved trades in any group)")
-        return {}
+        print("   (no resolved trades)")
+        return {}, 0
 
-    summary = {}
+    print()
+    print(f"   {'group':9s} {'n':>4s} {'nZ':>3s}  {'Z net':>7s} {'notZ net':>8s}  "
+          f"{'Z minus notZ':>20s}  {'room pass-fail':>20s}  "
+          f"{'pooled Z':>20s}  {'pooled room':>20s}")
 
-    for gname, g_trades in groups:
+    summaries = {}
+    shown = 0
 
-        print()
-        print(f"{gname}   ({len(g_trades)} trades)")
+    for name, g_trades in groups:
 
-        z_all = [t for t in g_trades if t["z"]]
-        nz_all = [t for t in g_trades if not t["z"]]
+        s = summarize_group(g_trades, threshold, min_cell, min_pooled)
+        summaries[name] = s
 
-        print("   group               n   win%   net R     SE      t")
+        shown += sum(
+            1 for d in (s["z_minus_nz"], s["pass_minus_fail"]) if d[0] == d[0]
+        )
+        if s["pooled"]:
+            shown += 2
 
-        for name, grp in (("ALL", g_trades), ("Z", z_all), ("not Z", nz_all)):
-            n, win, mean, se = zr.cell_stats(grp)
-            flag = " *" if n < MIN_TRADES else ""
-            print(
-                f"   {name:16s} {n:4d} {_f_n(win)}  "
-                f"{es.f_r(mean)}  {es.f_se(se)}  "
-                f"{es.f_t(mean, se)}{flag}"
-            )
+        flag = " *" if s["n_z"] < MIN_TRADES else ""
 
-        for T in thresholds:
+        print(
+            f"   {str(name):9s} {s['n']:4d} {s['n_z']:3d}  "
+            f"{es.f_r(s['z_net']):>7s} {es.f_r(s['nz_net']):>8s}  "
+            f"{f_diff_t(s['z_minus_nz']):>20s}  "
+            f"{f_diff_t(s['pass_minus_fail']):>20s}  "
+            f"{f_pooled(s['pooled'], 'z'):>20s}  "
+            f"{f_pooled(s['pooled'], 'room'):>20s}{flag}"
+        )
 
-            print()
-            print(f"   --- threshold T = {T:g}R ---")
+        if detail:
+            print_cells(s)
 
-            t_z_pass, t_room_z, t_room_nz = print_cells_and_diffs(
-                g_trades, T, indent="   "
-            )
+    print()
+    print("   * = fewer than "
+          f"{MIN_TRADES} Z trades in the group: treat that line as noise.")
 
-            print_summary_line(g_trades, T, t_z_pass, t_room_z, t_room_nz)
+    for label, getter in (
+        ("Z minus notZ      ", lambda s: s["z_minus_nz"][0]),
+        ("room pass - fail  ", lambda s: s["pass_minus_fail"][0]),
+        ("pooled Z effect   ", lambda s: s["pooled"]["z"][0] if s["pooled"] else NAN),
+        ("pooled room effect", lambda s: s["pooled"]["room"][0] if s["pooled"] else NAN),
+    ):
+        k, m, p = sign_tally([getter(s) for s in summaries.values()])
 
-            summary[(gname, T)] = {
-                "n": len(g_trades),
-                "n_z": len(z_all),
-                "t_z_pass": t_z_pass,
-                "t_room_z": t_room_z,
-                "t_room_nz": t_room_nz,
-            }
+        if m == 0:
+            print(f"   Sign test, {label}: no group had enough trades")
+        else:
+            p_txt = "n/a" if p != p else f"{p:.2f}"
+            print(f"   Sign test, {label}: positive in {k} of {m} groups "
+                  f"(two-sided p {p_txt})")
 
-    return summary
+    return summaries, shown
 
 
 # =====================================================================
@@ -261,101 +299,117 @@ def parse_floats(text):
     return [float(x) for x in str(text).split(",") if x.strip()]
 
 
+def collect_rows_by_backtest(args, full):
+    """The same one-run-per-window set-up as tools/z_vs_room.py."""
+
+    windows = ["head", "tail"] if args.which == "both" else [args.which]
+    rows = []
+
+    for window in windows:
+
+        df = zr.slice_window(full, window, args.rows)
+
+        print(f"[{window}] {len(df)} candles: {df.index[0]} -> {df.index[-1]}")
+
+        window_rows, result = zr.run_far_target(df)
+
+        if result.errors:
+            print(f"WARNING: {len(result.errors)} engine errors; "
+                  f"first: {result.errors[0]}")
+
+        print(f"[{window}] triggered {result.total_trades_triggered}, "
+              f"analysed {len(window_rows)}")
+
+        for r in window_rows:
+            r["window"] = window
+
+        rows.extend(window_rows)
+
+    return rows
+
+
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True)
-    parser.add_argument(
-        "--rows", type=int, default=40000,
-        help="Candles per window (default 40000). 0 = all.",
-    )
-    parser.add_argument(
-        "--which", choices=["tail", "head", "both"], default="both",
-        help="tail = last N candles; head = first N candles; "
-             "both = run head then tail (default).",
-    )
+    parser.add_argument("--from-csv", default=None,
+                        help="Per-trade CSV written by tools/z_vs_room.py "
+                             "--output. Skips the backtests.")
+    parser.add_argument("--data", default=None,
+                        help="5M OHLC CSV (needed when --from-csv is not used).")
+    parser.add_argument("--rows", type=int, default=40000,
+                        help="Candles per window (default 40000). 0 = all.")
+    parser.add_argument("--which", choices=["tail", "head", "both"],
+                        default="both")
     parser.add_argument("--cost", type=float, default=DEFAULT_COST)
-    parser.add_argument(
-        "--targets",
-        default=",".join(f"{t:g}" for t in TARGETS),
-        help="Fixed-R exits to evaluate, comma separated (default 2,5).",
-    )
-    parser.add_argument(
-        "--thresholds",
-        default=",".join(f"{t:g}" for t in THRESHOLDS),
-        help="Room thresholds in R, comma separated (default 1.5).",
-    )
+    parser.add_argument("--targets", default=",".join(f"{t:g}" for t in TARGETS),
+                        help="Fixed-R exits, comma separated (default 2,5).")
+    parser.add_argument("--thresholds",
+                        default=",".join(f"{t:g}" for t in THRESHOLDS),
+                        help="Room thresholds in R (default 1.5).")
+    parser.add_argument("--min-cell", type=int, default=MIN_CELL,
+                        help=f"Trades needed in each cell for a difference "
+                             f"(default {MIN_CELL}).")
+    parser.add_argument("--min-pooled", type=int, default=MIN_POOLED,
+                        help=f"Trades needed in a group for the pooled "
+                             f"regression (default {MIN_POOLED}).")
+    parser.add_argument("--per-window", action="store_true",
+                        help="Report head and tail separately instead of "
+                             "pooling them (quarters then split at the "
+                             "boundary).")
+    parser.add_argument("--detail", action="store_true",
+                        help="Also print the four room cells for every group.")
     args = parser.parse_args()
+
+    if not args.from_csv and not args.data:
+        parser.error("give --from-csv or --data")
 
     targets = parse_floats(args.targets)
     thresholds = parse_floats(args.thresholds)
 
-    full = es.load_ohlc(Path(args.data))
-
-    windows = ["head", "tail"] if args.which == "both" else [args.which]
-
     started = time.perf_counter()
 
-    for window in windows:
+    if args.from_csv:
+        rows = rows_from_csv(args.from_csv)
+        print(f"Read {len(rows)} trades from {args.from_csv}")
+    else:
+        rows = collect_rows_by_backtest(args, es.load_ohlc(Path(args.data)))
 
-        df = (
-            full.head(args.rows)
-            if (window == "head" and args.rows > 0)
-            else full.tail(args.rows)
-            if (args.rows > 0)
-            else full
-        )
+    if not rows:
+        print("No trades to analyse.")
+        return
 
-        print()
-        print("#" * 72)
-        print(f"# WINDOW: {window}")
-        print("#" * 72)
-        print(f"Using {len(df)} candles: {df.index[0]} -> {df.index[-1]}")
-        print(
-            f"Price over the sample: "
-            f"{float(df['close'].iloc[0]):.2f} -> "
-            f"{float(df['close'].iloc[-1]):.2f}"
-        )
+    times = [r["entry_time"] for r in rows]
+    print(f"Trades: {len(rows)}, entries {min(times)} -> {max(times)}")
 
-        rows, result = zr.run_far_target(df)
+    if args.per_window:
+        sets = [
+            (w, [r for r in rows if r.get("window") == w])
+            for w in sorted({r.get("window") for r in rows})
+        ]
+    else:
+        sets = [("ALL", rows)]
 
-        if result.errors:
-            print(
-                f"WARNING: {len(result.errors)} engine errors; "
-                f"first: {result.errors[0]}"
-            )
+    looks = 0
 
-        print(
-            f"Engine: candidates {result.total_signals_generated}, "
-            f"triggered {result.total_trades_triggered}, "
-            f"invalidated {result.total_invalidated}, "
-            f"expired {result.total_expired}"
-        )
-
+    for set_name, set_rows in sets:
         for target in targets:
-            report_by_group(
-                rows, "quarter", target, args.cost, thresholds,
-                window, "QUARTER",
-            )
-            report_by_group(
-                rows, "direction", target, args.cost, thresholds,
-                window, "DIRECTION",
-            )
-
-    # Multiple-testing correction note: the number of comparisons is
-    # roughly windows x targets x 2 group keys x cells per group x
-    # thresholds. Print a conservative correction so the reader knows
-    # what t to look for.
-    looks = len(windows) * len(targets) * 2 * 5 * len(thresholds)
-    print()
-    print(
-        f"You looked at about {looks} comparisons. After correcting "
-        f"for that, a t of about {es.z_needed(looks):.1f} is needed, "
-        f"not 2."
-    )
+            for T in thresholds:
+                for key in ("quarter", "direction"):
+                    _, shown = report_split(
+                        set_rows, key, target, args.cost, T,
+                        f"[{set_name}]", args.min_cell, args.min_pooled,
+                        args.detail,
+                    )
+                    looks += shown
 
     print()
-    print(f"* = fewer than {MIN_TRADES} trades: treat as noise")
+    if looks:
+        print(
+            f"You looked at {looks} t-statistics. After correcting for that, "
+            f"a t of about {es.z_needed(looks):.1f} is needed, not 2. "
+            f"(Conservative: the splits share trades.)"
+        )
+
     print(f"Total runtime: {time.perf_counter() - started:.1f}s")
 
 
