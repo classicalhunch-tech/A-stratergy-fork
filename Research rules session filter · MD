@@ -1,89 +1,88 @@
 # Research Rules: Session Filter (H-S1)
 
-Status: DRAFT. Becomes binding only when committed. After commit, only the Run Log (section 9) may change.
+Status: DRAFT until committed. After commit, only the Run Log (section 9) may change.
 
-Related: Z hypothesis is PARKED (unproven, not retired). Its rules document is separate and unchanged.
+Related: the Z hypothesis is PARKED (unproven, not retired). Its rules document is separate and unchanged.
 
 ---
 
 ## 1. Question (one only)
 
-Do trades from the frozen setup that are *signalled* during the London/NY overlap have a higher mean R than trades signalled outside it?
+Do trades from the frozen setup that are signalled during the London/NY overlap have a higher mean R than trades signalled outside it?
 
-This is one question. No other filters, symbols, exits or fill modes are tested under this document.
+No other filters, exits, fill modes or windows are tested under this document.
 
 ## 2. Hypothesis
 
 H-S1: mean R (in-window) minus mean R (out-of-window) is greater than 0.
 
-Reason to believe it (stated before testing): the overlap has the most liquidity and the most stop runs, which is when a sweep-and-reverse setup should work best.
+Reason, stated before testing: the overlap has the most liquidity and the most stop runs, which is when a sweep-and-reverse setup should work best.
 
 ## 3. Data
 
-- **Dev data** (80,000 candles, 2025-08-20 to 2026-10-06): used up. Allowed uses: trade counts, SD of R, and sanity checks. Looking at the in-window vs out-of-window effect on dev data is allowed only as *exploratory*, must be written in the Run Log, and does not count toward the decision.
-- **Holdout data**: new, non-overlapping data never used for any development. Priority: gold history before 2025-08-20 or after 2026-10-06; second choice: a basket of other symbols (each symbol is a separate test, pooled only if section 6 says so).
-- The holdout file is committed before it is run. Record: file name, row count, git commit hash of these rules.
+- **Dev data** (80,000 gold candles, 2025-08-20 to 2026-10-06): used up. Allowed uses: trade counts, SD of R, sanity checks. Any look at the in-window vs out-of-window effect on dev data is exploratory, must be written in the Run Log, and does not count toward the decision.
+- **Holdout data**: new, non-overlapping, never used in development. Symbols: gold, EURUSD, GBPUSD (a 3-symbol basket planned from the start).
+- Each holdout file is committed before it is run. Record: file name, row count, git commit hash of these rules.
 
 ## 4. Frozen setup (no edits after the freeze)
 
-- Fill mode: market on close (touch, then fill at next bar's open). Touch fill is NOT used (it books unachievable fills).
+- Fill mode: market on close (touch, then fill at next bar's open). Touch fill is NOT used.
 - No MTF gate, no ATR widening.
-- Exit: structural 15M swing target, minimum 1.5R. *(OPEN: see section 10, Q2.)*
-- Cost: 0.5 price units round trip, fixed, for the decision. Cost 1.0 reported as sensitivity only.
+- **Decision exit: fixed 2R.** The structural 15M target is reported as a sensitivity result only and cannot change the decision.
 - Trade pool: ALL trades from the frozen setup, regardless of Z/A/B/X tag.
 - Frozen files: strategy/backtest.py, signals.py, retest_engine.py, structure_targets.py, swings.py, zones.py, liquidity.py, mtf_structure.py, dashboard/mtf_context.py, requirements.txt, and every tool used for this test.
-- Freeze starts when the holdout file is committed.
+- Freeze starts when the first holdout file is committed.
+
+### Cost policy
+
+- **Gold, holdout 2026 or later:** fixed 0.5 price units round trip.
+- **Gold, holdout before 2024:** 0.5 scaled by price level: 0.5 x (median close of the holdout file / median close of the dev file).
+- **EURUSD and GBPUSD:** cost is set so it is the same share of the typical candle as on gold: 0.115 x the median 5M range of that symbol's holdout file (0.5 / 4.354 from the gold dev data). Computed from prices only, never from trade results. The cost-scale guard in main.py must pass for every file.
+- Cost 1.0 (gold-equivalent, scaled the same way) is reported as sensitivity only.
 
 ## 5. Definition of "in-window"
 
-- Timestamps are true UTC (the data check shows daily reopen moving 22:00 / 23:00 with US daylight saving, which is what UTC data of a CME-linked market looks like).
-- In-window = trade signal time between **13:00 and 17:00 UTC**, Monday to Friday.
-- The window is fixed in UTC and is not adjusted for daylight saving. Real overlap shifts by one hour for part of the year; that is accepted as noise.
-- The window is chosen now and not tuned. If it is changed after any result is seen, the test is void.
+- Timestamps are true UTC (daily reopen moves 22:00 / 23:00 with US daylight saving, as UTC data for a CME-linked market does).
+- In-window = trade signal time from **13:00 to 17:00 UTC**, Monday to Friday.
+- Fixed in UTC, not adjusted for daylight saving (accepted as noise).
+- If the window is changed after any result is seen, the test is void.
 
 ## 6. Analysis (the one number)
 
 - One tool, one run, one configuration.
-- De-duplication: if two trades open on the same calendar day in the same direction, keep the first only.
-- Estimate: OLS of net R on an in-window dummy, with standard errors clustered by calendar day.
-- Read only: the in-window coefficient, its cluster-robust SE, and the 80% confidence interval.
-- Pooling: gold holdout is its own test. Other symbols are separate tests. They are pooled into one decision only if all are run under identical rules and the pooled design is stated in the Run Log before any of them is run.
+- De-duplication: if two trades open on the same calendar day, same symbol, same direction, keep the first only.
+- Estimate: OLS of net R on an in-window dummy, standard errors clustered by calendar day.
+- **Pooling:** the three symbols are pooled into one decision only if all are run under identical rules. The pooled design (symbol fixed effects, clustering by calendar day across symbols) must be written in the Run Log BEFORE any symbol is run. Per-symbol results are reported but do not decide.
+- Read only: the in-window coefficient, its clustered SE, the 80% CI and the 90% CI.
 
 ## 7. Decision rule (single decision, preset size)
 
-- **Minimum sample:** the decision is made once, when the smaller group (in or out) reaches the trade count N* from section 8. No peeking before that. No per-holdout verdicts.
-- **Smallest worthwhile effect (SWE):** +0.20R.
-- **PASS:** coefficient > 0 and the lower end of the 80% CI is above 0.
-- **RULED OUT:** the upper end of the 80% CI is below +0.20R. Only then is H-S1 set aside.
-- **INCONCLUSIVE:** anything else. This is not a failure and not a pass; it means more data is needed.
-- "Two fails in a row" is NOT used.
+- **When:** once, when the smaller group (in-window) reaches N* trades after de-duplication. No peeking before that. No per-holdout verdicts. "Two fails in a row" is NOT used.
+- **Smallest worthwhile effect (SWE): +0.30R.**
+- **PASS:** coefficient > 0 and the lower end of the 90% CI is above 0 (matches the one-sided 5% used to size N*).
+- **RULED OUT:** the upper end of the 80% CI is below +0.30R. Only then is H-S1 set aside.
+- **INCONCLUSIVE:** anything else. It means more data is needed, not that the idea failed or passed.
 
-## 8. Sample size (power calculation)
+## 8. Sample size
 
-Rough numbers, to be recomputed from the real SD of R on dev data before the freeze:
-
-- Assume SD of R about 1.5.
-- To detect 0.30R difference with 80% power (one-sided 5%): about 310 trades per group.
-- To detect 0.20R: about 700 per group.
-- N* is set to the number the final calculation gives. It is written here before commit: **N* = ____ per group.**
-
-**Feasibility warning:** the CI log shows about 34 closed trades in roughly 6 months under the gated market-on-close setup. Even if the ungated pool is several times larger, a few hundred trades per group is many years on gold alone. If the dev-data trade rate says N* cannot be reached in a reasonable time, this test must be run on a basket of symbols or the question must be dropped. Fill in the ungated trade rate here: **trades per year (ungated, dev data) = ____.**
+- Basis: SD of R about 1.5, difference 0.30R, 80% power, one-sided 5%.
+- **N* = 310 trades per group** (after de-duplication).
+- Before commit, check the real SD of R and the clustering effect on dev data. If they change the number materially, update N* here before commit.
+- **Feasibility check (fill before commit):**
+  - Ungated trades per year on gold, dev data: ____
+  - Share of trades that fall in-window, dev data: ____
+  - Total trades needed = 310 / in-window share = ____
+  - Years of basket history needed = ____
+- If the years needed are not realistic, the test is dropped or redesigned before the freeze, not after.
 
 ## 9. Run Log (the only part editable after commit)
 
-| Date | Data file | Rows | Rules commit hash | Trades in / out | Coefficient | SE (clustered) | 80% CI | Decision |
-|------|-----------|------|-------------------|-----------------|-------------|----------------|--------|----------|
-|      |           |      |                   |                 |             |                |        |          |
+| Date | Data file(s) | Rows | Rules commit hash | Trades in / out | Coefficient | SE (clustered) | 80% CI | 90% CI | Decision |
+|------|--------------|------|-------------------|-----------------|-------------|----------------|--------|--------|----------|
+|      |              |      |                   |                 |             |                |        |        |          |
 
 Decision is filled in the same session as the run.
 
-## 10. Open questions (decide before commit)
+## 10. Tool needed (not yet written)
 
-1. Is 13:00 to 17:00 UTC the window you want? (Alternative: 12:00 to 16:00.) Pick one; do not test both.
-2. Decision exit: structural target, or fixed 2R? Fixed 2R is cheaper to power. Check which one the dev trade counts support.
-3. Gold only, or a basket of symbols to reach N* in time?
-4. Cost policy: fixed 0.5 (as above), or scaled with price level over history?
-
-## 11. Tool needed (not yet written)
-
-`tools/session_vs_outside.py` must: run the frozen backtest once, tag each trade in/out of window by signal time, de-duplicate by day and direction, fit the clustered OLS, and print only the section 6 numbers. It must be reviewed before the freeze. A bug found after the freeze voids the holdout.
+`tools/session_vs_outside.py` must: run the frozen backtest once per symbol, tag each trade in/out of window by signal time, de-duplicate, fit the pooled clustered OLS, and print only the section 6 numbers. It must be reviewed before the freeze. A bug found after the freeze voids the holdout.
