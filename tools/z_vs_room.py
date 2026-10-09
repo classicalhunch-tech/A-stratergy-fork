@@ -26,9 +26,21 @@ For each room threshold T the trades fall into four cells:
     Z / room >= T     Z / room < T     not Z / room >= T     not Z / room < T
 
 Cells hold different trades, so they are compared with a Welch (unpaired)
-difference, not a paired one. A pooled regression (net R on Z and room-pass,
-robust SE) is also printed: it gives the Z effect with room held constant and
-the room effect with Z held constant, using every trade at once.
+difference, not a paired one. A pooled regression (net R on Z and room-pass)
+gives the Z effect with room held constant and the room effect with Z held
+constant, using every trade at once. It is printed three ways:
+
+    HC1                     trade-level robust SE (the original line)
+    week-clustered          SE clustered by ISO week: trades opened in the same
+                            days share one price path, so they are not
+                            independent. This is the line to decide on.
+    + stop-size control     the same, with log(stop distance) added. Room in R
+                            is distance-to-swing divided by the stop, so a
+                            tight stop raises room mechanically. If the room
+                            effect disappears here, "room" is a stop-size
+                            effect.
+
+Identical trades (same entry time, direction and stop) are counted once.
 
 Run on --which head and --which tail (or --which both) and compare.
 Costs are applied after the fact: net = gross - cost / risk (price units).
@@ -63,6 +75,11 @@ T_CRIT = 2.0
 TINY_MIN_RR = 1e-9
 ROOM_EPS = 1e-9
 
+# Cluster-robust SEs are unreliable (often far too small) with few clusters.
+# Below this many weeks the pooled line falls back to the trade-level HC1 SE
+# and says so.
+MIN_CLUSTERS = 15
+
 NAN = float("nan")
 
 
@@ -74,6 +91,36 @@ def room_passes(room_r, threshold):
     """True if there is a swing and it is at least `threshold` R away."""
 
     return room_r is not None and room_r >= threshold - ROOM_EPS
+
+
+def week_label(ts):
+    """ISO year-week of a timestamp, used as the cluster key."""
+
+    iso = pd.Timestamp(ts).isocalendar()
+
+    return f"{int(iso[0])}-W{int(iso[1]):02d}"
+
+
+def dedupe_rows(rows):
+    """
+    Drops trades that repeat another trade's entry time, direction and stop
+    (to 4 decimals). Such trades are the same position counted twice, which
+    shrinks every SE. Returns (kept rows, number dropped).
+    """
+
+    seen = set()
+    kept = []
+
+    for r in rows:
+        key = (r["entry_time"], r["direction"], round(r["stop"], 4))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        kept.append(r)
+
+    return kept, len(rows) - len(kept)
 
 
 def resolved_trades(rows, target, cost):
@@ -97,6 +144,8 @@ def resolved_trades(rows, target, cost):
                 "win": g > 0,
                 "z": r["label"] == FOCUS,
                 "room": r["room_r"],
+                "risk": r["risk"],
+                "week": week_label(r["entry_time"]),
                 # carried through so callers can split the trades afterwards
                 "quarter": r.get("quarter"),
                 "direction": r.get("direction"),
@@ -140,17 +189,66 @@ def welch_diff(a, b, min_n=2):
     return diff, se, diff / se
 
 
-def pooled_effects(trades, threshold):
+def ols_robust(X, y, groups=None):
     """
-    OLS of net R on [1, Z, room-pass] with HC1 robust standard errors.
+    OLS coefficients and robust standard errors.
 
-    Returns {"z": (coef, se), "room": (coef, se)} or None when the model
-    cannot be estimated (too few trades, or Z or room never varies).
+    groups None  : HC1 (trade-level), scaled by n / (n - k).
+    groups given : cluster-robust (CR1), scaled by G/(G-1) * (n-1)/(n-k).
+                   With every trade its own cluster this equals HC1.
+    Falls back to HC1 when there are fewer than 2 clusters.
+    """
+
+    n, k = X.shape
+
+    xtx_inv = np.linalg.inv(X.T @ X)
+    beta = xtx_inv @ X.T @ y
+    resid = y - X @ beta
+
+    labels = None if groups is None else sorted(set(groups))
+
+    if labels is None or len(labels) < 2:
+        meat = (X * (resid ** 2)[:, None]).T @ X
+        cov = xtx_inv @ meat @ xtx_inv * (n / (n - k))
+    else:
+        index = {g: [] for g in labels}
+
+        for i, g in enumerate(groups):
+            index[g].append(i)
+
+        meat = np.zeros((k, k))
+
+        for rows in index.values():
+            s = X[rows].T @ resid[rows]
+            meat += np.outer(s, s)
+
+        g_count = len(labels)
+        cov = (
+            xtx_inv @ meat @ xtx_inv
+            * (g_count / (g_count - 1))
+            * ((n - 1) / (n - k))
+        )
+
+    return beta, np.sqrt(np.diag(cov))
+
+
+def pooled_effects(trades, threshold, cluster=True, control=False):
+    """
+    OLS of net R on [1, Z, room-pass] (plus log stop distance if `control`).
+
+    cluster=True clusters the SE by ISO week (needs trades from
+    resolved_trades); cluster=False is the trade-level HC1 line.
+
+    Returns {"z": (coef, se), "room": (coef, se), "clusters": G or None,
+    "note": text or None} or None when the model cannot be estimated (too few
+    trades, or Z or room never varies). With fewer than MIN_CLUSTERS weeks the
+    clustered request falls back to HC1 and "note" says so.
     """
 
     n = len(trades)
+    k = 4 if control else 3
 
-    if n <= 3:
+    if n <= k + 1:
         return None
 
     y = np.array([t["net"] for t in trades], dtype=float)
@@ -159,22 +257,33 @@ def pooled_effects(trades, threshold):
         [1.0 if room_passes(t["room"], threshold) else 0.0 for t in trades]
     )
 
-    X = np.column_stack([np.ones(n), z, p])
+    columns = [np.ones(n), z, p]
 
-    if np.linalg.matrix_rank(X) < 3:
+    if control:
+        columns.append(np.log(np.array([t["risk"] for t in trades], dtype=float)))
+
+    X = np.column_stack(columns)
+
+    if np.linalg.matrix_rank(X) < k:
         return None
 
-    xtx_inv = np.linalg.inv(X.T @ X)
-    beta = xtx_inv @ X.T @ y
-    resid = y - X @ beta
+    groups = [t["week"] for t in trades] if cluster else None
+    note = None
 
-    meat = (X * (resid ** 2)[:, None]).T @ X
-    cov = xtx_inv @ meat @ xtx_inv * (n / (n - 3))
-    se = np.sqrt(np.diag(cov))
+    if groups is not None and len(set(groups)) < MIN_CLUSTERS:
+        note = (
+            f"only {len(set(groups))} weeks (< {MIN_CLUSTERS}): "
+            f"trade-level HC1 used instead"
+        )
+        groups = None
+
+    beta, se = ols_robust(X, y, groups)
 
     return {
         "z": (float(beta[1]), float(se[1])),
         "room": (float(beta[2]), float(se[2])),
+        "clusters": len(set(groups)) if groups is not None else None,
+        "note": note,
     }
 
 
@@ -272,6 +381,27 @@ def f_diff(label, d):
     t_txt = "n/a" if t != t else f"{t:+.2f}"
 
     return f"   {label}: {es.f_r(diff)} (SE {es.f_se(se)}, t {t_txt})"
+
+
+def f_pooled_line(name, pooled):
+    if pooled is None:
+        return f"   {name}: not estimable (Z or room never varies)"
+
+    zc, zs = pooled["z"]
+    rc, rs = pooled["room"]
+
+    clusters = pooled.get("clusters")
+    extra = "" if clusters is None else f" [{clusters} weeks]"
+
+    if pooled.get("note"):
+        extra += f" ({pooled['note']})"
+
+    return (
+        f"   {name}{extra}:  Z effect (room held fixed) "
+        f"{es.f_r(zc)} (SE {es.f_se(zs)}, t {es.f_t(zc, zs)})   "
+        f"room effect (Z held fixed) {es.f_r(rc)} "
+        f"(SE {es.f_se(rs)}, t {es.f_t(rc, rs)})"
+    )
 
 
 # =====================================================================
@@ -398,6 +528,15 @@ def report_target(window, rows, target, thresholds, cost, crit):
                 f"{es.f_se(se)}{flag}"
             )
 
+        n_pass = stats[("Z", True)][0] + stats[("notZ", True)][0]
+        n_fail = stats[("Z", False)][0] + stats[("notZ", False)][0]
+
+        print(
+            f"   Group sizes the holdout rules count: Z trades {len(z_all)}; "
+            f"room pass {n_pass}, room fail {n_fail} "
+            f"(smaller room group {min(n_pass, n_fail)})"
+        )
+
         d_z_pass = welch_diff(stats[("Z", True)], stats[("notZ", True)])
         d_z_fail = welch_diff(stats[("Z", False)], stats[("notZ", False)])
         d_room_z = welch_diff(stats[("Z", True)], stats[("Z", False)])
@@ -410,19 +549,13 @@ def report_target(window, rows, target, thresholds, cost, crit):
         print(f_diff("room pass minus fail (Z)     ", d_room_z))
         print(f_diff("room pass minus fail (notZ)  ", d_room_nz))
 
-        pooled = pooled_effects(trades, T)
+        pooled_hc = pooled_effects(trades, T, cluster=False)
+        pooled = pooled_effects(trades, T, cluster=True)
+        pooled_ctrl = pooled_effects(trades, T, cluster=True, control=True)
 
-        if pooled is None:
-            print("   Pooled (OLS): not estimable (Z or room never varies)")
-        else:
-            zc, zs = pooled["z"]
-            rc, rs = pooled["room"]
-            print(
-                f"   Pooled OLS, robust SE:  Z effect (room held fixed) "
-                f"{es.f_r(zc)} (SE {es.f_se(zs)}, t {es.f_t(zc, zs)})   "
-                f"room effect (Z held fixed) {es.f_r(rc)} "
-                f"(SE {es.f_se(rs)}, t {es.f_t(rc, rs)})"
-            )
+        print(f_pooled_line("Pooled OLS, robust SE (HC1, trade-level)", pooled_hc))
+        print(f_pooled_line("Pooled OLS, week-clustered SE", pooled))
+        print(f_pooled_line("Pooled OLS + stop-size control, week-clustered", pooled_ctrl))
 
         v = verdict(d_z_pass[2], d_room_z[2], d_room_nz[2], crit)
         print(f"   Reading at t > {crit:g}: {v}")
@@ -456,7 +589,9 @@ def report_target(window, rows, target, thresholds, cost, crit):
             "d_z_pass": d_z_pass[0],
             "d_room_notz": d_room_nz[0],
             "pooled": pooled,
-            "n_room_pass": len(cells[("Z", True)]) + len(cells[("notZ", True)]),
+            "pooled_hc": pooled_hc,
+            "pooled_control": pooled_ctrl,
+            "n_room_pass": n_pass,
         }
 
     return summaries
@@ -487,8 +622,8 @@ def report_stability(results, targets, thresholds):
 
     for target in targets:
         print()
-        print(f"Fixed {target:g}R  (pooled OLS: coefficient in R, then t; "
-              f"positive = better)")
+        print(f"Fixed {target:g}R  (pooled OLS, week-clustered: coefficient in R, "
+              f"then t; positive = better)")
         print("   T      Z effect head          Z effect tail          "
               "room effect head       room effect tail       sign flip?")
 
@@ -562,6 +697,10 @@ def main():
     parser.add_argument("--output", default=None, help="Optional per-trade CSV.")
     args = parser.parse_args()
 
+    if args.which == "both" and args.rows <= 0:
+        parser.error("--which both needs --rows > 0 (otherwise head and tail "
+                     "are the same candles)")
+
     targets = parse_floats(args.targets)
     thresholds = parse_floats(args.thresholds)
 
@@ -569,7 +708,7 @@ def main():
 
     windows = ["head", "tail"] if args.which == "both" else [args.which]
 
-    if args.which == "both" and args.rows > 0 and 2 * args.rows > len(full):
+    if args.which == "both" and 2 * args.rows > len(full):
         print(
             f"WARNING: head and tail of {args.rows} candles overlap in a "
             f"{len(full)}-candle file, so they are not independent halves."
@@ -607,14 +746,13 @@ def main():
             f"expired {result.total_expired}"
         )
 
-        keys = [(r["entry_time"], r["direction"], round(r["stop"], 4)) for r in rows]
-        duplicates = len(keys) - len(set(keys))
+        rows, duplicates = dedupe_rows(rows)
         mismatches = sum(1 for r in rows if r["stopped"] != r["engine_stopped"])
         censored = sum(1 for r in rows if not r["stopped"])
 
-        print(f"Trades analysed: {len(rows)}")
-        print(f"Trades sharing entry time, direction and stop with another "
-              f"trade: {duplicates} (counted twice in every n and SE)")
+        print(f"Trades analysed: {len(rows)} "
+              f"(dropped {duplicates} repeat(s) of another trade's entry "
+              f"time, direction and stop)")
         print(f"Replay vs engine stop mismatches: {mismatches} (must be 0). "
               f"Trades never stopped before the data ended: {censored}.")
 
