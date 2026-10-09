@@ -1,0 +1,36 @@
+import math
+
+import numpy as np
+
+from tools.bif import bif
+from tools.rank_stability import rank_stability
+
+
+def test_perfect_rank_persistence():
+    a = np.arange(10.0)
+    r = rank_stability(a, a * 2 + 1)
+    assert abs(r["spearman"] - 1) < 1e-9 and r["winner_oos_percentile"] == 1.0
+
+
+def test_reversed_ranks_flagged():
+    a = np.arange(10.0)
+    r = rank_stability(a, -a)
+    assert r["spearman"] < -0.99 and r["verdict"].startswith("PROBLEM")
+
+
+def test_noise_ranks_low_correlation():
+    rng = np.random.default_rng(0)
+    r = rank_stability(rng.normal(size=200), rng.normal(size=200))
+    assert abs(r["spearman"]) < 0.25
+
+
+def test_too_few():
+    assert math.isnan(rank_stability([1, 2], [1, 2])["spearman"])
+
+
+def test_bif_cases():
+    assert bif(3.0, 3.0)["bif"] == 1.0
+    assert "inflated" in bif(4.0, 1.0)["verdict"]
+    assert "SIGN FLIP" in bif(2.0, -1.0)["verdict"]
+    assert math.isinf(bif(2.0, 0.0)["bif"])
+    assert math.isnan(bif(float("nan"), 1.0)["bif"])
