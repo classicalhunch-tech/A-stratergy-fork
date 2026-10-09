@@ -225,6 +225,7 @@ def main():
         first, last = as_utc(df.index[0]), as_utc(df.index[-1])
         print(f"[{name}] {len(df)} candles {first} -> {last}")
         print(f"[{name}] clock: {tz_note}")
+        print(f"[{name}] median close {float(df['close'].median()):.6g}   median 5M range {float((df['high'] - df['low']).median()):.6g}")
         print(f"[{name}] weekend reopen times (UTC), most common: {reopen_times(df)}")
         print("          gold on this data reopens 22:00 or 23:00; FX typically 21:00 or 22:00")
 
