@@ -1,0 +1,90 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from tools.walk_forward import (make_folds, purge_overlap_and_embargo, run,
+                                summarize)
+
+
+def D(*days):
+    return pd.to_datetime([f"2026-01-{d:02d}" for d in days])
+
+
+def test_purge_removes_overlapping_labels():
+    train = D(1, 2, 3, 4, 5, 6, 7)
+    test = D(10, 11, 12)
+    kept = purge_overlap_and_embargo(train, test, label_horizon=5, embargo_days=0)
+    # t + 5 >= 10  ->  t >= 5 dropped
+    assert list(kept.day) == [1, 2, 3, 4]
+
+
+def test_embargo_removes_after_test():
+    train = D(1, 13, 14, 15, 16, 17, 18, 19)
+    test = D(10, 11, 12)
+    kept = purge_overlap_and_embargo(train, test, label_horizon=0, embargo_days=5)
+    # (12, 17] dropped
+    assert list(kept.day) == [1, 18, 19]
+
+
+def test_folds_contiguous_and_cover():
+    folds = make_folds(23, 5)
+    flat = np.concatenate(folds)
+    assert list(flat) == list(range(23))
+    assert all(f[-1] + 1 == g[0] for f, g in zip(folds, folds[1:]))
+
+
+def _df(n=100):
+    rng = np.random.default_rng(0)
+    return pd.DataFrame({
+        "entry_time": pd.date_range("2026-01-01", periods=n, freq="D"),
+        "net_r": rng.normal(0, 1, n),
+        "in_window": rng.integers(0, 2, n),
+    })
+
+
+def _fit(y, w):
+    c = y[w == 1].mean() - y[w == 0].mean() if len(set(w)) > 1 else np.nan
+    return c, 1.0
+
+
+def test_run_each_fold_has_two_trades_and_summary():
+    t = run(_df(), n_folds=5, fit=_fit)
+    assert len(t) == 5 and (t["n_test"] >= 2).all()
+    s = summarize(t)
+    assert 0 <= s["frac_positive"] <= 1
+
+
+def test_empty_fold_graceful():
+    t = run(_df(3), n_folds=5, fit=_fit)
+    assert t["coef"].isna().any()
+    summarize(t)
+
+
+def test_stub_without_clusters_param_still_works():
+    def old_style(y, w):
+        return 0.5, 1.0
+    t = run(_df(), n_folds=5, fit=old_style)
+    assert (t["coef"] == 0.5).all()
+
+
+def test_clusters_are_per_day_labels():
+    seen = []
+
+    def spy(y, w, clusters=None):
+        seen.append(clusters)
+        return 0.0, 1.0
+    df = _df(100)
+    df = pd.concat([df, df], ignore_index=True)  # two trades per day
+    run(df, n_folds=5, fit=spy)
+    assert len(seen) == 5
+    for c in seen:
+        assert c.dtype.kind in "OU"  # string date labels
+        assert len(set(c)) < len(c)  # shared days collapse into clusters
+
+
+def test_real_fit_does_not_crash():
+    # No stub: exercises the real ols_cluster path via _fit (the clusters=None bug).
+    pytest.importorskip("tools.session_vs_outside")
+    t = run(_df(), n_folds=5)
+    assert len(t) == 5
+    assert not t["coef"].isna().all()
