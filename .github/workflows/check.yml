@@ -473,3 +473,60 @@ jobs:
             z_vs_room_by_group_per_window.txt
             z_vs_room_trades.csv
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # Session filter H-S1, sizing run. Manual only (Actions -> check ->
+  # Run workflow).
+  #
+  # Runs the new tool in --sizing-only mode on the gold development
+  # data. It prints trade counts, the in-window share, trades per
+  # year, SD of R and the years of data needed. It never prints a
+  # group mean or the coefficient, so it is safe on development data.
+  # The results are printed on the run's Summary page.
+  # Needs: tools/session_vs_outside.py and
+  # tests/test_session_vs_outside.py.
+  # ---------------------------------------------------------------
+  session_sizing:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: .
+    name: session filter sizing (gold development data, no group means)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Tests for the session tool
+        run: pytest -q tests/test_session_vs_outside.py
+
+      - name: Sizing run (counts, in-window share, SD of R, years needed)
+        run: |
+          set -o pipefail
+          python tools/session_vs_outside.py --sizing-only \
+            --dataset "gold,data/real_gold_data_5m.csv,fixed:0.5" \
+            | tee session_sizing.txt
+
+      - name: Show the results on the run's Summary page
+        if: always()
+        run: |
+          {
+            echo '## Session filter: sizing run (no group means)'
+            echo '```'
+            cat session_sizing.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-sizing
+          path: session_sizing.txt
+          if-no-files-found: ignore
