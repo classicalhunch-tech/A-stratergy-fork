@@ -3,6 +3,15 @@ on:
   push:
     branches: [main, feature/multi-timeframe]
   workflow_dispatch:
+    inputs:
+      n_trials:
+        description: "Number of variants tried so far (for the Deflated Sharpe Ratio in z_vs_room)"
+        default: "80"
+        required: false
+      effective_trials:
+        description: "Effective number of independent trials (optional; overrides n_trials in the DSR)"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -448,6 +457,32 @@ jobs:
             --from-csv z_vs_room_trades.csv --cost 0.5 --per-window --detail \
             | tee z_vs_room_by_group_per_window.txt
 
+      # Advisory: the DSR needs per-trade net R. If the CSV has no net_r column it is
+      # rebuilt as r_multiple - cost / initial_risk, with the same 0.5 cost as above.
+      # N is what you declare at dispatch; it is NOT counted automatically.
+      - name: Deflated Sharpe Ratio on the pooled trades (advisory)
+        continue-on-error: true
+        env:
+          N_TRIALS: ${{ inputs.n_trials }}
+          EFF_TRIALS: ${{ inputs.effective_trials }}
+        run: |
+          set -o pipefail
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("z_vs_room_trades.csv")
+          print("columns:", list(df.columns))
+          if "net_r" not in df.columns:
+              if not {"r_multiple", "initial_risk"} <= set(df.columns):
+                  raise SystemExit("need net_r, or r_multiple and initial_risk, in z_vs_room_trades.csv")
+              df["net_r"] = df["r_multiple"] - 0.5 / df["initial_risk"]
+          df[["net_r"]].to_csv("dsr_input.csv", index=False)
+          print("trades:", len(df))
+          EOF
+          EFF=""
+          if [ -n "$EFF_TRIALS" ]; then EFF="--effective-trials $EFF_TRIALS"; fi
+          python tools/deflated_sharpe.py --trades dsr_input.csv --returns-col net_r \
+            --n-trials "${N_TRIALS:-80}" $EFF | tee z_vs_room_dsr.txt
+
       - name: Show the results on the run's Summary page
         if: always()
         run: |
@@ -460,6 +495,10 @@ jobs:
             echo '```'
             cat z_vs_room_by_group.txt 2>/dev/null || true
             echo '```'
+            echo '## Deflated Sharpe Ratio (N declared at dispatch)'
+            echo '```'
+            cat z_vs_room_dsr.txt 2>/dev/null || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload
@@ -471,6 +510,7 @@ jobs:
             z_vs_room_both.txt
             z_vs_room_by_group.txt
             z_vs_room_by_group_per_window.txt
+            z_vs_room_dsr.txt
             z_vs_room_trades.csv
           if-no-files-found: ignore
 
@@ -485,6 +525,8 @@ jobs:
   # The results are printed on the run's Summary page.
   # Needs: tools/session_vs_outside.py and
   # tests/test_session_vs_outside.py.
+  # Do NOT add DSR, bootstrap or walk-forward steps here: they print result
+  # statistics, and this job must stay free of results on development data.
   # ---------------------------------------------------------------
   session_sizing:
     if: github.event_name == 'workflow_dispatch'
