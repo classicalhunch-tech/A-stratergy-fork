@@ -50,7 +50,10 @@ def _fit(y, window, clusters=None):
     X = np.column_stack([np.ones(len(y)), window])
     if clusters is None:
         clusters = np.arange(len(y))  # each trade its own cluster
-    return ols_cluster(y, X, clusters)
+    res = ols_cluster(y, X, clusters)
+    if res is None:  # singular design, e.g. every trade in the same group
+        return float("nan"), float("nan")
+    return res
 
 
 def _accepts_clusters(fit) -> bool:
@@ -73,12 +76,14 @@ def run(df: pd.DataFrame, returns_col="net_r", window_col="in_window",
     for k, idx in enumerate(make_folds(len(d), n_folds), start=1):
         test = d.iloc[idx]
         if len(test) < 2:
-            rows.append(dict(fold=k, n_train=0, n_test=len(test), coef=np.nan, se=np.nan, t=np.nan))
+            rows.append(dict(fold=k, n_train=0, n_test=len(test), coef=np.nan, se=np.nan,
+                             t=np.nan, error="fewer than 2 trades in fold"))
             continue
         rest = d.drop(d.index[idx])
         keep = purge_overlap_and_embargo(rest[time_col], test[time_col],
                                          label_horizon, embargo_days)
         n_train = int(rest[time_col].isin(keep).sum())
+        error = ""
         try:
             y = test[returns_col].to_numpy(float)
             w = test[window_col].to_numpy(float)
@@ -89,9 +94,13 @@ def run(df: pd.DataFrame, returns_col="net_r", window_col="in_window",
                 coef, se = fit(y, w)
             coef, se = float(np.atleast_1d(coef)[-1]), float(np.atleast_1d(se)[-1])
             t = coef / se if se and np.isfinite(se) else np.nan
-        except Exception:
+        except Exception as exc:  # keep going, but say what went wrong
             coef = se = t = np.nan
-        rows.append(dict(fold=k, n_train=n_train, n_test=len(test), coef=coef, se=se, t=t))
+            error = f"{type(exc).__name__}: {exc}"
+        if not error and np.isnan(coef):
+            error = "not estimable (window dummy has no variation in this fold)"
+        rows.append(dict(fold=k, n_train=n_train, n_test=len(test), coef=coef, se=se, t=t,
+                         error=error))
     return pd.DataFrame(rows)
 
 
