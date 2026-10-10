@@ -151,11 +151,17 @@ def main(argv=None) -> int:
     ap.add_argument("--n-star", type=int, default=None)
     a = ap.parse_args(argv)
 
-    df = pd.read_csv(a.pool)
-    n_signal = int((df[a.signal_col].astype(float) > 0).sum())
-    check_guards(a.data_used, a.exploratory, a.n_star, n_signal)
-    cols = [c for c in a.strata_cols.split(",") if c]
-    res = baseline(df, a.signal_col, a.returns_col, a.time_col, cols, a.n_reps, a.seed)
+    try:
+        df = pd.read_csv(a.pool)
+        if a.signal_col not in df.columns:
+            raise ValueError(f"column '{a.signal_col}' not found in pool")
+        n_signal = int((df[a.signal_col].astype(float) > 0).sum())
+        check_guards(a.data_used, a.exploratory, a.n_star, n_signal)
+        cols = [c for c in a.strata_cols.split(",") if c]
+        res = baseline(df, a.signal_col, a.returns_col, a.time_col, cols, a.n_reps, a.seed)
+    except ValueError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
     print(format_report(res, a.alpha))
     return 0
 
