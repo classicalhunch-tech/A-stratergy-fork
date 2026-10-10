@@ -118,14 +118,18 @@ def main(argv=None) -> int:
     tr.add_argument("--data-used", choices=list(VALID_DATA), default=None)
 
     a = ap.parse_args(argv)
-    if a.cmd == "add":
-        row = add_entry(a.path, a.hypothesis, a.data_used, a.coefficient, a.se,
-                        a.n_trades, a.decision, a.notes)
-        print("logged:", row["date"], row["hypothesis"], row["decision"])
-    elif a.cmd == "show":
-        print(format_table(read_entries(a.path)))
-    else:
-        print(count_trials(a.path, a.data_used))
+    try:
+        if a.cmd == "add":
+            row = add_entry(a.path, a.hypothesis, a.data_used, a.coefficient, a.se,
+                            a.n_trades, a.decision, a.notes)
+            print("logged:", row["date"], row["hypothesis"], row["decision"])
+        elif a.cmd == "show":
+            print(format_table(read_entries(a.path)))
+        else:
+            print(count_trials(a.path, a.data_used))
+    except ValueError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
     return 0
 
 
