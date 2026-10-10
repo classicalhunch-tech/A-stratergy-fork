@@ -82,6 +82,28 @@ def test_clusters_are_per_day_labels():
         assert len(set(c)) < len(c)  # shared days collapse into clusters
 
 
+def test_failed_fold_reports_its_error():
+    def boom(y, w, clusters=None):
+        raise ValueError("boom")
+    t = run(_df(), n_folds=5, fit=boom)
+    assert t["coef"].isna().all()
+    assert t["error"].str.contains("boom").all()
+
+
+def test_singular_fold_gives_nan_with_reason_not_crash():
+    # Real fit, window dummy constant: design is singular, ols_cluster returns None.
+    df = _df()
+    df["in_window"] = 1
+    t = run(df, n_folds=5)
+    assert t["coef"].isna().all()
+    assert t["error"].str.contains("not estimable").all()
+
+
+def test_healthy_folds_have_empty_error():
+    t = run(_df(), n_folds=5, fit=_fit)
+    assert (t["error"] == "").all()
+
+
 def test_real_fit_does_not_crash():
     # No stub: exercises the real ols_cluster path via _fit (the clusters=None bug).
     pytest.importorskip("tools.session_vs_outside")
