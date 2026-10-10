@@ -1,21 +1,287 @@
-name: toolkit
+name: check
 on:
   push:
     branches: [main, feature/multi-timeframe]
   workflow_dispatch:
+    inputs:
+      n_trials:
+        description: "Number of variants tried so far (for the Deflated Sharpe Ratio in z_vs_room)"
+        default: "80"
+        required: false
+      effective_trials:
+        description: "Effective number of independent trials (optional; overrides n_trials in the DSR)"
+        default: ""
+        required: false
 
 permissions:
   contents: read
 
-# Fast check (about a minute) for the research toolkit in tools/.
-# It does not run any backtest and prints no strategy results, so it is safe to run
-# on every push. The long workflow "check" is unchanged.
 jobs:
-  toolkit:
+  check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 120
     env:
       PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 0. Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: 1. Backtest (main.py) and which version it is
+        continue-on-error: true
+        run: |
+          grep -nE 'MTF_MACRO_TF|MTF_INTERNAL_TF' main.py || echo "main.py is the OLD version (default 4h macro)"
+          python main.py --data data/master_historical_data.csv
+
+      - name: 1b. Cost-scale guard must refuse gold-sized costs on EURUSD-scale data
+        run: |
+          if python main.py --data data/master_historical_data.csv --spread 0.30 --slippage 0.10; then
+            echo "ERROR: the cost-scale guard did not refuse. Gold-sized costs on EURUSD-scale data give meaningless R numbers."
+            exit 1
+          fi
+          echo "guard refused as expected"
+
+      - name: 1c. Price range of the CSV (is it gold-sized?)
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/master_historical_data.csv", index_col=0, parse_dates=True)
+          print("close min:", float(df["close"].min()), "| close max:", float(df["close"].max()))
+          print("median 5m range:", float((df["high"] - df["low"]).median()))
+          EOF
+
+      - name: 1d. Backtest, real gold data with real costs (baseline, direction gate ON)
+        continue-on-error: true
+        run: |
+          python main.py --data data/real_gold_data_5m.csv \
+                         --spread 0.30 --slippage 0.10 --commission 0.0
+
+      - name: 1e. Fill rule comparison and cost sensitivity (real data)
+        continue-on-error: true
+        run: python tools/compare_fill_modes.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 1f. Data schedule check (time zone and daylight saving)
+        continue-on-error: true
+        run: python tools/check_data_sessions.py --data data/real_gold_data_5m.csv
+
+      - name: 2. Tracked files that .gitignore would ignore
+        continue-on-error: true
+        run: git ls-files -ci --exclude-standard
+
+      - name: 3. Data sanity (is the CSV real broker data?)
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/master_historical_data.csv", index_col=0, parse_dates=True)
+          gaps = df.index.to_series().diff().dropna()
+          print("rows:", len(df), "| range:", df.index[0], "->", df.index[-1])
+          print("columns:", list(df.columns))
+          print("gaps longer than 30 min:", int((gaps > pd.Timedelta(minutes=30)).sum()))
+          print("candles on Saturday:", int((df.index.dayofweek == 5).sum()))
+          EOF
+
+      - name: 3b. Real gold data sanity
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("data/real_gold_data_5m.csv", index_col=0, parse_dates=True)
+          gaps = df.index.to_series().diff().dropna()
+          print("rows:", len(df))
+          print("range:", df.index[0], "->", df.index[-1])
+          print("close min:", float(df["close"].min()), "| close max:", float(df["close"].max()))
+          print("median 5m range:", float((df["high"] - df["low"]).median()))
+          print("gaps longer than 30 min:", int((gaps > pd.Timedelta(minutes=30)).sum()))
+          print("candles on Saturday:", int((df.index.dayofweek == 5).sum()))
+          EOF
+
+      - name: 4. Tests (excluding the look-ahead test)
+        run: pytest -q tests --ignore=tests/test_mtf_causality.py
+
+      - name: 5. Third-party imports used in the repo
+        continue-on-error: true
+        run: |
+          git grep -hE '^\s*(import|from)\s+[A-Za-z_]' -- '*.py' | sed -E 's/^\s+//' | awk '{print $2}' | cut -d. -f1 | sort | uniq -c | sort -rn | head -60
+
+      - name: 6. MTF look-ahead test
+        run: python tests/test_mtf_causality.py
+
+      - name: 6b. MTF look-ahead test on real data
+        continue-on-error: true
+        run: python tests/test_mtf_causality.py data/real_gold_data_5m.csv
+
+      - name: 7. Hard-coded credentials check (file and line only)
+        continue-on-error: true
+        run: |
+          git grep -nPi '(password|passwd|api[_-]?key|secret|token)\w*\s*[:=]\s*["\x27][^"\x27]{4,}["\x27]' -- '*.py' '*.json' '*.toml' '*.cfg' '*.ini' '*.ps1' 2>&1 | cut -d: -f1,2 | head -50 || true
+          git grep -nPi 'login\s*[:=]\s*[0-9]{5,}' -- '*.py' '*.json' '*.toml' '*.cfg' '*.ini' 2>&1 | cut -d: -f1,2 | head -50 || true
+          git ls-files | grep -Ei '(^|/)\.env' || echo "no .env files tracked"
+          echo "credentials check done"
+
+      - name: 8. Time handling in live code, and session settings
+        continue-on-error: true
+        run: |
+          git grep -nE 'tz_localize|tz_convert|timezone|utc|server_time|time_offset|copy_rates|fromtimestamp|to_datetime|TIMEFRAME' -- phase_04_live ':!*test*' | head -120 || true
+          echo "----- phase_03_paper/config.py -----"
+          sed -n '1,220p' phase_03_paper/config.py
+
+      - name: 9. Syntax check of live code (cannot be imported on Linux)
+        continue-on-error: true
+        run: python -m py_compile phase_04_live/main.py phase_04_live/market/live_source.py phase_04_live/broker/mt5.py phase_04_live/runtime/loop.py && echo "syntax OK"
+
+      - name: 10. Verification greps and tested package versions
+        continue-on-error: true
+        run: |
+          echo "----- python and package versions (the tested set) -----"
+          python --version
+          pip freeze | grep -iE '^(pandas|numpy|pytest|python-dateutil)==' || true
+          echo "----- live source: reject_gaps -----"
+          grep -n "reject_gaps" phase_04_live/market/live_source.py || echo "live_source.py does NOT pass reject_gaps"
+          echo "----- callers of .check( in code -----"
+          git grep -n '\.check(' -- phase_04_live phase_03_paper strategy | head -40 || true
+          echo "----- live base timeframe -----"
+          grep -n "TIMEFRAME" phase_04_live/main.py | head -10 || true
+          echo "----- who uses strategy/rules.py (TradingRules) -----"
+          git grep -nE 'strategy\.rules|TradingRules' -- '*.py' | head -20 || true
+          echo "----- MTFConfig defaults -----"
+          grep -nE 'macro_tf|internal_tf|base_interval|origin' dashboard/mtf_context.py | head -20 || true
+
+      - name: 11. mark_history_loaded must be called in the live loop
+        run: |
+          git grep -n "mark_history_loaded" -- phase_04_live
+          git grep -q "mark_history_loaded" -- phase_04_live/runtime/loop.py || { echo "NOT CALLED in loop.py"; exit 1; }
+
+      - name: 12. MTF split and reward sweep (market on close)
+        if: always()
+        continue-on-error: true
+        run: python tools/mtf_split.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 13. Pattern tags and fill-anchored target (market on close)
+        if: always()
+        continue-on-error: true
+        run: python tools/pattern_report.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 14. Structural target vs fixed R (market on close, no MTF gate)
+        if: always()
+        continue-on-error: true
+        run: python tools/structure_target_report.py --data data/real_gold_data_5m.csv --rows 40000
+
+      - name: 15. ATR stop A/B (0.10 vs 0.25 x ATR(14))
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          from strategy.backtest import run_backtest
+          from dashboard.mtf_context import MTFConfig
+          from strategy.mtf_structure import build_mtf_dataset_with_structure
+          from strategy.swings import find_swings
+
+          DATA = "data/real_gold_data_5m.csv"
+          ROWS = 40000
+          COST = 0.5
+          MIN_TRADES = 20
+
+          df = pd.read_csv(DATA, index_col=0, parse_dates=True)
+          df.columns = [c.strip().lower() for c in df.columns]
+          df = df[["open", "high", "low", "close"]].astype(float).dropna()
+          df = df.tail(ROWS)
+
+          enriched = build_mtf_dataset_with_structure(
+              df,
+              macro_swings_fn=find_swings,
+              internal_swings_fn=find_swings,
+              config=MTFConfig(macro_tf="1h", internal_tf="15min"),
+          )
+
+          def make_tagger(tagger):
+              def fn(signal, current_time):
+                  signal.pattern = tagger(signal, current_time)
+                  return True
+              return fn
+
+          try:
+              from strategy.pattern_tags import build_pattern_tagger, PATTERN_LABELS
+              tagger = build_pattern_tagger(enriched)
+              mf = make_tagger(tagger)
+          except Exception as exc:
+              print(f"pattern tagger unavailable: {exc}")
+              mf = None
+              PATTERN_LABELS = []
+
+          def closed(result):
+              return [t for t in result.trades
+                      if t.result_status in ("WIN", "LOSS") and t.initial_risk > 0]
+
+          def summarize(label, trades):
+              if not trades:
+                  print(f"   {label:16s}    0 trades")
+                  return
+              wins = sum(1 for t in trades if t.result_status == "WIN")
+              net = sum(t.r_multiple - COST / t.initial_risk
+                        for t in trades) / len(trades)
+              stops = sorted(t.initial_risk for t in trades)
+              flag = " *" if len(trades) < MIN_TRADES else ""
+              print(f"   {label:16s} {len(trades):4d} trades  "
+                    f"win {100.0*wins/len(trades):5.1f}%  "
+                    f"net@{COST} {net:+.3f}R  "
+                    f"median stop {stops[len(stops)//2]:.2f}{flag}")
+
+          for atr_mult in (0.0, 0.10, 0.25):
+              print()
+              print(f"=== stop_atr_mult = {atr_mult} (market on close, no MTF gate) ===")
+              result = run_backtest(
+                  df,
+                  reward_multiple=2.0,
+                  mtf_filter_fn=mf,
+                  fill_mode="market_on_close",
+                  target_anchor="zone",
+                  stop_atr_mult=atr_mult,
+              )
+              trades = closed(result)
+              print(f"   candidates {result.total_signals_generated}, "
+                    f"triggered {result.total_trades_triggered}, "
+                    f"invalidated {result.total_invalidated}, "
+                    f"expired {result.total_expired}")
+              summarize("ALL", trades)
+              for label in PATTERN_LABELS:
+                  group = [t for t in trades
+                           if getattr(t.signal, "pattern", "U_unknown") == label]
+                  summarize(label, group)
+              if result.errors:
+                  print(f"   WARNING: {len(result.errors)} errors; "
+                        f"first: {result.errors[0]}")
+
+          print()
+          print(f"* = fewer than {MIN_TRADES} trades")
+          EOF
+
+  # ---------------------------------------------------------------
+  # Experiments: direction gate ON vs OFF at 2R / 3R / 5R.
+  # Manual only (Actions -> check -> Run workflow). 6 parallel jobs,
+  # ~13 minutes each, so ~80 runner-minutes per manual run.
+  # Fill mode is "touch" (the engine default), the same as step 1d.
+  # Market-on-close results are already printed by steps 12 and 13.
+  # ---------------------------------------------------------------
+  experiments:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: .
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: ["on", "off"]
+        reward: [2.0, 3.0, 5.0]
+    name: experiments (gate ${{ matrix.gate }}, reward ${{ matrix.reward }}R)
     steps:
       - uses: actions/checkout@v4
 
@@ -26,101 +292,283 @@ jobs:
       - name: Install packages (pinned, strict)
         run: pip install -r requirements.txt
 
-      # Names every missing file at once. Without this, pytest stops at the first
-      # missing file and says nothing about the others.
-      - name: 0. Toolkit files must be in the repository
+      - name: Backtest, real gold data, real costs
+        continue-on-error: true
         run: |
-          missing=0
-          for f in \
-            tools/deflated_sharpe.py tools/block_bootstrap.py tools/rank_stability.py \
-            tools/bif.py tools/walk_forward.py tools/session_vs_outside.py \
-            tools/random_entry_baseline.py tools/ledger.py \
-            tests/test_deflated_sharpe.py tests/test_block_bootstrap.py \
-            tests/test_rank_stability.py tests/test_bif.py tests/test_walk_forward.py \
-            tests/test_session_vs_outside.py tests/test_random_entry_baseline.py \
-            tests/test_ledger.py; do
-            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
-          done
-          if [ "$missing" = "1" ]; then
-            echo "Add the missing files to the repository, commit and push."
-            exit 1
-          fi
-          echo "all toolkit files present"
+          FLAG=""
+          if [ "${{ matrix.gate }}" = "off" ]; then FLAG="--no-direction-gate"; fi
+          python main.py --data data/real_gold_data_5m.csv \
+                         --spread 0.30 --slippage 0.10 --commission 0.0 \
+                         --reward-multiple ${{ matrix.reward }} $FLAG \
+                         --output trades.csv
 
-      - name: 1. Toolkit tests
-        run: |
-          pytest -q -rs \
-            tests/test_deflated_sharpe.py \
-            tests/test_block_bootstrap.py \
-            tests/test_rank_stability.py \
-            tests/test_bif.py \
-            tests/test_walk_forward.py \
-            tests/test_session_vs_outside.py \
-            tests/test_random_entry_baseline.py \
-            tests/test_ledger.py
-
-      # test_real_fit_does_not_crash uses pytest.importorskip. If the import ever
-      # fails, pytest reports a skip, not a failure, and the real fitting path would
-      # go untested without anyone noticing. This step turns a skip into a failure.
-      - name: 2. The real-fit walk-forward test must run, not skip
-        run: |
-          set -o pipefail
-          pytest -q -rs tests/test_walk_forward.py::test_real_fit_does_not_crash | tee realfit.txt
-          if grep -qi "skipped" realfit.txt; then
-            echo "ERROR: test_real_fit_does_not_crash was skipped, so the real ols_cluster path is untested."
-            exit 1
-          fi
-
-      - name: 3. Random-entry baseline command line (synthetic data)
+      - name: Results split by 1H / 15M trend at signal time (net of costs)
+        continue-on-error: true
         run: |
           python - <<'EOF'
-          import numpy as np
           import pandas as pd
-          rng = np.random.default_rng(0)
+
+          df = pd.read_csv("trades.csv")
+          if df.empty:
+              raise SystemExit("no closed trades")
+
+          print("directions seen:", sorted(df["direction"].astype(str).unique()))
+
+          def tag(row):
+              d = str(row["direction"]).upper()
+              if "LONG" in d:
+                  want = "BULLISH"
+              elif "SHORT" in d:
+                  want = "BEARISH"
+              else:
+                  return "unknown"
+              m = str(row["macro_trend_at_signal"]).upper()
+              i = str(row["internal_trend_at_signal"]).upper()
+              m_ok = m == want
+              i_ok = i == want
+              if m not in ("BULLISH", "BEARISH") and i not in ("BULLISH", "BEARISH"):
+                  return "unknown"
+              if m_ok and i_ok:
+                  return "both_agree"
+              if m_ok:
+                  return "macro_only_agrees"
+              if i_ok:
+                  return "internal_only_agrees"
+              return "against_both"
+
+          df["tag"] = df.apply(tag, axis=1)
+
           rows = []
-          for d in range(60):
-              day = pd.Timestamp("2026-01-01") + pd.Timedelta(days=d)
-              for j in range(6):
-                  rows.append(dict(entry_time=day + pd.Timedelta(minutes=5 * j),
-                                   net_r=rng.normal(0, 1),
-                                   direction="long" if j % 2 == 0 else "short",
-                                   is_signal=1 if j < 2 else 0))
-          pd.DataFrame(rows).to_csv("ci_pool.csv", index=False)
+          for name, g in [("ALL", df)] + list(df.groupby("tag")):
+              n = len(g)
+              r = g["r_multiple"]
+              se = r.std(ddof=1) / (n ** 0.5) if n > 1 else float("nan")
+              rows.append({
+                  "group": name,
+                  "trades": n,
+                  "win_pct": round(100 * (g["result_status"] == "WIN").mean(), 1),
+                  "net_R": round(r.mean(), 3),
+                  "SE": round(se, 3),
+              })
+
+          print(pd.DataFrame(rows).to_string(index=False))
+          print("net_R is after costs. A group is not distinguishable from zero")
+          print("unless |net_R| is well above 2 x SE. Under 20 trades = noise.")
           EOF
-          python tools/random_entry_baseline.py --pool ci_pool.csv --data-used dev \
-            --exploratory --strata-cols direction --n-reps 300 --seed 1
-          if python tools/random_entry_baseline.py --pool ci_pool.csv --data-used dev --n-reps 10; then
-            echo "ERROR: dev data ran without --exploratory."
-            exit 1
-          fi
-          if python tools/random_entry_baseline.py --pool ci_pool.csv --data-used holdout --n-reps 10; then
-            echo "ERROR: holdout ran without --n-star."
-            exit 1
-          fi
-          echo "guards refused as expected"
 
-      - name: 4. Ledger command line (temporary file)
+  # ---------------------------------------------------------------
+  # Exit study: one backtest, every exit. Manual only.
+  # Runs exit_study.py on both halves of the gold data (tail = last
+  # 40000, head = first 40000) so Z can be checked for stability
+  # across time. Output text and per-trade CSV are uploaded as
+  # artifacts.
+  # ---------------------------------------------------------------
+  exit_study:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: .
+    strategy:
+      fail-fast: false
+      matrix:
+        which: [tail, head]
+    name: exit study (${{ matrix.which }} 40000 rows)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Exit study
         run: |
-          L=/tmp/ci_ledger.csv
-          python tools/ledger.py --path $L add --hypothesis "ci smoke" --data-used holdout \
-            --coefficient 0.1 --se 0.05 --n-trades 10 --decision PASS
-          if python tools/ledger.py --path $L add --hypothesis "ci smoke" --data-used holdout \
-               --coefficient 0.1 --se 0.05 --n-trades 10 --decision PASS; then
-            echo "ERROR: the ledger accepted a second holdout row for the same hypothesis."
-            exit 1
-          fi
-          test "$(python tools/ledger.py --path $L trials)" = "1"
-          echo "ledger OK"
+          set -o pipefail
+          python tools/exit_study.py --data data/real_gold_data_5m.csv \
+            --rows 40000 --which ${{ matrix.which }} \
+            --output exit_study_trades_${{ matrix.which }}.csv \
+            | tee exit_study_${{ matrix.which }}.txt
 
-      - name: 5. Trial ledger on the Summary page (docs/ledger.csv)
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exit-study-${{ matrix.which }}
+          path: |
+            exit_study_${{ matrix.which }}.txt
+            exit_study_trades_${{ matrix.which }}.csv
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # Z vs room. Manual only (Actions -> check -> Run workflow).
+  #
+  # Answers: is the edge in the Z label (against both the 1H and the
+  # 15M trend) or in the room rule (nearest 15M swing >= T x risk
+  # away)? Fixed 2R and 5R exits, T = 1, 1.5, 2, 3, 5.
+  #
+  # One job, not a head/tail matrix, on purpose:
+  #   1. tools/z_vs_room.py runs the engine once per half (head, then
+  #      tail) and writes every trade to z_vs_room_trades.csv.
+  #   2. tools/z_vs_room_by_group.py --from-csv then splits those SAME
+  #      trades by quarter and by direction in about a second, with no
+  #      second backtest. Head and tail are pooled, so a quarter that
+  #      straddles the boundary (2026Q1) is one group.
+  # The results are also printed on the run's Summary page, so nothing
+  # has to be downloaded to read them.
+  # Needs: tools/z_vs_room.py, tools/z_vs_room_by_group.py and their
+  # tests in tests/.
+  # ---------------------------------------------------------------
+  z_vs_room:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: .
+    name: z vs room (head and tail, then by quarter and direction)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Z vs room, head and tail (one backtest per half)
+        run: |
+          set -o pipefail
+          python tools/z_vs_room.py \
+            --data data/real_gold_data_5m.csv \
+            --rows 40000 --which both --cost 0.5 \
+            --output z_vs_room_trades.csv \
+            | tee z_vs_room_both.txt
+
+      - name: Split by quarter and direction (reads the saved trades, no backtest)
+        run: |
+          set -o pipefail
+          python tools/z_vs_room_by_group.py \
+            --from-csv z_vs_room_trades.csv --cost 0.5 \
+            | tee z_vs_room_by_group.txt
+          python tools/z_vs_room_by_group.py \
+            --from-csv z_vs_room_trades.csv --cost 0.5 --per-window --detail \
+            | tee z_vs_room_by_group_per_window.txt
+
+      # Advisory: the DSR needs per-trade net R. If the CSV has no net_r column it is
+      # rebuilt as r_multiple - cost / initial_risk, with the same 0.5 cost as above.
+      # N is what you declare at dispatch; it is NOT counted automatically.
+      - name: Deflated Sharpe Ratio on the pooled trades (advisory)
+        continue-on-error: true
+        env:
+          N_TRIALS: ${{ inputs.n_trials }}
+          EFF_TRIALS: ${{ inputs.effective_trials }}
+        run: |
+          set -o pipefail
+          python - <<'EOF'
+          import pandas as pd
+          df = pd.read_csv("z_vs_room_trades.csv")
+          print("columns:", list(df.columns))
+          if "net_r" not in df.columns:
+              if not {"r_multiple", "initial_risk"} <= set(df.columns):
+                  raise SystemExit("need net_r, or r_multiple and initial_risk, in z_vs_room_trades.csv")
+              df["net_r"] = df["r_multiple"] - 0.5 / df["initial_risk"]
+          df[["net_r"]].to_csv("dsr_input.csv", index=False)
+          print("trades:", len(df))
+          EOF
+          EFF=""
+          if [ -n "$EFF_TRIALS" ]; then EFF="--effective-trials $EFF_TRIALS"; fi
+          python tools/deflated_sharpe.py --trades dsr_input.csv --returns-col net_r \
+            --n-trials "${N_TRIALS:-80}" $EFF | tee z_vs_room_dsr.txt
+
+      - name: Show the results on the run's Summary page
         if: always()
         run: |
           {
-            echo '## Trial ledger (docs/ledger.csv)'
+            echo '## Z vs room: head vs tail stability'
             echo '```'
-            python tools/ledger.py show
-            echo "distinct hypotheses, all data : $(python tools/ledger.py trials)"
-            echo "distinct hypotheses, dev data : $(python tools/ledger.py trials --data-used dev)"
+            sed -n '/HEAD vs TAIL/,$p' z_vs_room_both.txt 2>/dev/null || true
             echo '```'
-            echo 'Compare these counts with the n_trials you declare for the Deflated Sharpe Ratio.'
+            echo '## By quarter and direction (head and tail pooled)'
+            echo '```'
+            cat z_vs_room_by_group.txt 2>/dev/null || true
+            echo '```'
+            echo '## Deflated Sharpe Ratio (N declared at dispatch)'
+            echo '```'
+            cat z_vs_room_dsr.txt 2>/dev/null || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: z-vs-room
+          path: |
+            z_vs_room_both.txt
+            z_vs_room_by_group.txt
+            z_vs_room_by_group_per_window.txt
+            z_vs_room_dsr.txt
+            z_vs_room_trades.csv
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # Session filter H-S1, sizing run. Manual only (Actions -> check ->
+  # Run workflow).
+  #
+  # Runs the new tool in --sizing-only mode on the gold development
+  # data. It prints trade counts, the in-window share, trades per
+  # year, SD of R and the years of data needed. It never prints a
+  # group mean or the coefficient, so it is safe on development data.
+  # The results are printed on the run's Summary page.
+  # Needs: tools/session_vs_outside.py and
+  # tests/test_session_vs_outside.py.
+  # Do NOT add DSR, bootstrap or walk-forward steps here: they print result
+  # statistics, and this job must stay free of results on development data.
+  # ---------------------------------------------------------------
+  session_sizing:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: .
+    name: session filter sizing (gold development data, no group means)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      - name: Tests for the session tool
+        run: pytest -q tests/test_session_vs_outside.py
+
+      - name: Sizing run (counts, in-window share, SD of R, years needed)
+        run: |
+          set -o pipefail
+          python tools/session_vs_outside.py --sizing-only \
+            --dataset "gold,data/real_gold_data_5m.csv,fixed:0.5" \
+            | tee session_sizing.txt
+
+      - name: Show the results on the run's Summary page
+        if: always()
+        run: |
+          {
+            echo '## Session filter: sizing run (no group means)'
+            echo '```'
+            cat session_sizing.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-sizing
+          path: session_sizing.txt
+          if-no-files-found: ignore
