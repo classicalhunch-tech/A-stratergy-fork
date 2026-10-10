@@ -1,0 +1,92 @@
+import os
+import tempfile
+
+import pytest
+
+from tools.ledger import (COLUMNS, add_entry, count_trials, main, read_entries)
+
+
+def _path():
+    d = tempfile.mkdtemp()
+    return os.path.join(d, "sub", "ledger.csv")  # sub dir must be created
+
+
+def _add(p, name="H1", data="dev", decision="EXPLORATORY"):
+    return add_entry(p, name, data, 0.05, 0.03, 100, decision, date="2026-10-10")
+
+
+def test_creates_file_with_header_and_row():
+    p = _path()
+    _add(p)
+    rows = read_entries(p)
+    assert len(rows) == 1
+    assert list(rows[0].keys()) == COLUMNS
+    assert rows[0]["hypothesis"] == "H1" and rows[0]["n_trades"] == "100"
+
+
+def test_appends_without_second_header():
+    p = _path()
+    _add(p, "H1")
+    _add(p, "H2")
+    with open(p) as f:
+        text = f.read()
+    assert text.count("hypothesis,") == 1
+    assert len(read_entries(p)) == 2
+
+
+def test_empty_ledger_reads_as_empty():
+    assert read_entries(_path()) == []
+    assert count_trials(_path()) == 0
+
+
+def test_invalid_decision_rejected():
+    with pytest.raises(ValueError):
+        _add(_path(), decision="MAYBE")
+
+
+def test_invalid_data_label_rejected():
+    with pytest.raises(ValueError):
+        _add(_path(), data="test")
+
+
+def test_blank_hypothesis_rejected():
+    with pytest.raises(ValueError):
+        _add(_path(), name="   ")
+
+
+def test_decision_is_case_insensitive():
+    p = _path()
+    row = _add(p, decision="ruled out")
+    assert row["decision"] == "RULED OUT"
+
+
+def test_holdout_is_single_use_per_hypothesis():
+    p = _path()
+    _add(p, "H1", "holdout", "PASS")
+    with pytest.raises(ValueError):
+        _add(p, "  h1 ", "holdout", "RULED OUT")  # same name, different spacing/case
+    _add(p, "H2", "holdout", "PASS")  # a different hypothesis is fine
+    _add(p, "H1", "dev", "EXPLORATORY")  # dev rows are never blocked
+
+
+def test_count_trials_counts_distinct_names():
+    p = _path()
+    _add(p, "H1", "dev")
+    _add(p, "H1", "dev")      # same hypothesis re-run: still one trial
+    _add(p, "H2", "dev")
+    _add(p, "H1", "holdout", "PASS")
+    assert count_trials(p) == 2
+    assert count_trials(p, "dev") == 2
+    assert count_trials(p, "holdout") == 1
+
+
+def test_cli_add_show_trials(capsys):
+    p = _path()
+    assert main(["--path", p, "add", "--hypothesis", "H1", "--data-used", "dev",
+                 "--coefficient", "0.1", "--se", "0.05", "--n-trades", "50",
+                 "--decision", "EXPLORATORY"]) == 0
+    assert main(["--path", p, "trials"]) == 0
+    out = capsys.readouterr().out
+    assert out.strip().splitlines()[-1] == "1"
+    assert main(["--path", p, "show"]) == 0
+    assert "H1" in capsys.readouterr().out
