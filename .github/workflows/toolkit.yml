@@ -1,0 +1,126 @@
+name: toolkit
+on:
+  push:
+    branches: [main, feature/multi-timeframe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Fast check (about a minute) for the research toolkit in tools/.
+# It does not run any backtest and prints no strategy results, so it is safe to run
+# on every push. The long workflow "check" is unchanged.
+jobs:
+  toolkit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages (pinned, strict)
+        run: pip install -r requirements.txt
+
+      # Names every missing file at once. Without this, pytest stops at the first
+      # missing file and says nothing about the others.
+      - name: 0. Toolkit files must be in the repository
+        run: |
+          missing=0
+          for f in \
+            tools/deflated_sharpe.py tools/block_bootstrap.py tools/rank_stability.py \
+            tools/bif.py tools/walk_forward.py tools/session_vs_outside.py \
+            tools/random_entry_baseline.py tools/ledger.py \
+            tests/test_deflated_sharpe.py tests/test_block_bootstrap.py \
+            tests/test_rank_stability.py tests/test_bif.py tests/test_walk_forward.py \
+            tests/test_session_vs_outside.py tests/test_random_entry_baseline.py \
+            tests/test_ledger.py; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "Add the missing files to the repository, commit and push."
+            exit 1
+          fi
+          echo "all toolkit files present"
+
+      - name: 1. Toolkit tests
+        run: |
+          pytest -q -rs \
+            tests/test_deflated_sharpe.py \
+            tests/test_block_bootstrap.py \
+            tests/test_rank_stability.py \
+            tests/test_bif.py \
+            tests/test_walk_forward.py \
+            tests/test_session_vs_outside.py \
+            tests/test_random_entry_baseline.py \
+            tests/test_ledger.py
+
+      # test_real_fit_does_not_crash uses pytest.importorskip. If the import ever
+      # fails, pytest reports a skip, not a failure, and the real fitting path would
+      # go untested without anyone noticing. This step turns a skip into a failure.
+      - name: 2. The real-fit walk-forward test must run, not skip
+        run: |
+          set -o pipefail
+          pytest -q -rs tests/test_walk_forward.py::test_real_fit_does_not_crash | tee realfit.txt
+          if grep -qi "skipped" realfit.txt; then
+            echo "ERROR: test_real_fit_does_not_crash was skipped, so the real ols_cluster path is untested."
+            exit 1
+          fi
+
+      - name: 3. Random-entry baseline command line (synthetic data)
+        run: |
+          python - <<'EOF'
+          import numpy as np
+          import pandas as pd
+          rng = np.random.default_rng(0)
+          rows = []
+          for d in range(60):
+              day = pd.Timestamp("2026-01-01") + pd.Timedelta(days=d)
+              for j in range(6):
+                  rows.append(dict(entry_time=day + pd.Timedelta(minutes=5 * j),
+                                   net_r=rng.normal(0, 1),
+                                   direction="long" if j % 2 == 0 else "short",
+                                   is_signal=1 if j < 2 else 0))
+          pd.DataFrame(rows).to_csv("ci_pool.csv", index=False)
+          EOF
+          python tools/random_entry_baseline.py --pool ci_pool.csv --data-used dev \
+            --exploratory --strata-cols direction --n-reps 300 --seed 1
+          if python tools/random_entry_baseline.py --pool ci_pool.csv --data-used dev --n-reps 10; then
+            echo "ERROR: dev data ran without --exploratory."
+            exit 1
+          fi
+          if python tools/random_entry_baseline.py --pool ci_pool.csv --data-used holdout --n-reps 10; then
+            echo "ERROR: holdout ran without --n-star."
+            exit 1
+          fi
+          echo "guards refused as expected"
+
+      - name: 4. Ledger command line (temporary file)
+        run: |
+          L=/tmp/ci_ledger.csv
+          python tools/ledger.py --path $L add --hypothesis "ci smoke" --data-used holdout \
+            --coefficient 0.1 --se 0.05 --n-trades 10 --decision PASS
+          if python tools/ledger.py --path $L add --hypothesis "ci smoke" --data-used holdout \
+               --coefficient 0.1 --se 0.05 --n-trades 10 --decision PASS; then
+            echo "ERROR: the ledger accepted a second holdout row for the same hypothesis."
+            exit 1
+          fi
+          test "$(python tools/ledger.py --path $L trials)" = "1"
+          echo "ledger OK"
+
+      - name: 5. Trial ledger on the Summary page (docs/ledger.csv)
+        if: always()
+        run: |
+          {
+            echo '## Trial ledger (docs/ledger.csv)'
+            echo '```'
+            python tools/ledger.py show
+            echo "distinct hypotheses, all data : $(python tools/ledger.py trials)"
+            echo "distinct hypotheses, dev data : $(python tools/ledger.py trials --data-used dev)"
+            echo '```'
+            echo 'Compare these counts with the n_trials you declare for the Deflated Sharpe Ratio.'
+          } >> "$GITHUB_STEP_SUMMARY"

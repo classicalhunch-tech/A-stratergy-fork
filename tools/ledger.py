@@ -1,0 +1,137 @@
+"""Trial ledger: one CSV row for every hypothesis test ever run.
+
+Why: the Deflated Sharpe Ratio needs the TRUE number of trials. Without a ledger you
+guess. With one, `trials` tells you.
+
+Columns: date, hypothesis, data_used, coefficient, se, n_trades, decision, notes
+
+Rules enforced
+--------------
+* data_used must be 'dev' or 'holdout'
+* decision must be PASS, RULED OUT, INCONCLUSIVE or EXPLORATORY
+  (EXPLORATORY is for dev-data runs that are not verdicts)
+* a hypothesis can be logged on holdout only ONCE (the holdout is single-use)
+
+Usage
+-----
+    python tools/ledger.py add --hypothesis "H-S1 session filter" --data-used dev \
+        --coefficient 0.05 --se 0.03 --n-trades 412 --decision EXPLORATORY
+    python tools/ledger.py show
+    python tools/ledger.py trials              # number to feed DSR --n-trials
+    python tools/ledger.py trials --data-used dev
+
+Default file: docs/ledger.csv  (change with --path)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime
+import os
+
+COLUMNS = ["date", "hypothesis", "data_used", "coefficient", "se", "n_trades",
+           "decision", "notes"]
+VALID_DECISIONS = ("PASS", "RULED OUT", "INCONCLUSIVE", "EXPLORATORY")
+VALID_DATA = ("dev", "holdout")
+DEFAULT_PATH = os.path.join("docs", "ledger.csv")
+
+
+def read_entries(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _norm(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def add_entry(path: str, hypothesis: str, data_used: str, coefficient: float,
+              se: float, n_trades: int, decision: str, notes: str = "",
+              date: str | None = None) -> dict:
+    hypothesis = hypothesis.strip()
+    if not hypothesis:
+        raise ValueError("hypothesis name is required")
+    if data_used not in VALID_DATA:
+        raise ValueError(f"data_used must be one of {VALID_DATA}")
+    decision = decision.strip().upper()
+    if decision not in VALID_DECISIONS:
+        raise ValueError(f"decision must be one of {VALID_DECISIONS}")
+    if int(n_trades) < 0:
+        raise ValueError("n_trades must be >= 0")
+    if data_used == "holdout":
+        for row in read_entries(path):
+            if row["data_used"] == "holdout" and _norm(row["hypothesis"]) == _norm(hypothesis):
+                raise ValueError(
+                    f"holdout already logged for '{hypothesis}'; the holdout is single-use")
+    row = dict(date=date or datetime.date.today().isoformat(), hypothesis=hypothesis,
+               data_used=data_used, coefficient=coefficient, se=se,
+               n_trades=int(n_trades), decision=decision, notes=notes)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        if new_file:
+            w.writeheader()
+        w.writerow(row)
+    return row
+
+
+def count_trials(path: str, data_used: str | None = None) -> int:
+    """Number of distinct hypotheses logged (optionally only for dev or holdout)."""
+    names = set()
+    for row in read_entries(path):
+        if data_used is None or row["data_used"] == data_used:
+            names.add(_norm(row["hypothesis"]))
+    return len(names)
+
+
+def format_table(rows: list) -> str:
+    if not rows:
+        return "(ledger is empty)"
+    lines = [" | ".join(COLUMNS)]
+    for r in rows:
+        lines.append(" | ".join(str(r.get(c, "")) for c in COLUMNS))
+    return "\n".join(lines)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--path", default=DEFAULT_PATH)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    add = sub.add_parser("add")
+    add.add_argument("--hypothesis", required=True)
+    add.add_argument("--data-used", required=True, choices=list(VALID_DATA))
+    add.add_argument("--coefficient", type=float, required=True)
+    add.add_argument("--se", type=float, required=True)
+    add.add_argument("--n-trades", type=int, required=True)
+    add.add_argument("--decision", required=True)
+    add.add_argument("--notes", default="")
+
+    sub.add_parser("show")
+
+    tr = sub.add_parser("trials")
+    tr.add_argument("--data-used", choices=list(VALID_DATA), default=None)
+
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "add":
+            row = add_entry(a.path, a.hypothesis, a.data_used, a.coefficient, a.se,
+                            a.n_trades, a.decision, a.notes)
+            print("logged:", row["date"], row["hypothesis"], row["decision"])
+        elif a.cmd == "show":
+            print(format_table(read_entries(a.path)))
+        else:
+            print(count_trials(a.path, a.data_used))
+    except ValueError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
