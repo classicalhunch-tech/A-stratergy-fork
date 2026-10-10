@@ -1,0 +1,164 @@
+"""Random-entry baseline: does the strategy's signal beat luck?
+
+The question this answers
+-------------------------
+"If I had entered at random times (same days, same direction, same exit rules),
+how often would I have done at least as well as the signal did?"
+
+How it works (a stratified permutation test)
+--------------------------------------------
+You give it a POOL of candidate trades: every trade the frozen backtest would have
+taken if it entered at EVERY eligible bar (same stop, target, costs and exit rules as
+the real strategy). One column flags which of those the real signal actually took.
+
+Within each stratum (same calendar day, plus any extra columns such as direction)
+the tool draws, at random, the same number of trades the signal took, and records
+their mean net R. It repeats this many times. The result is the distribution of mean
+net R you get from "random entries with the same exposure". The p-value is the share
+of random draws that did at least as well as the signal (with the +1 correction).
+
+Why stratify by day and direction: gold trends. A strategy that mostly buys on up
+days looks good for no reason. Matching day and direction removes that advantage so
+only the TIMING skill of the signal is measured.
+
+Guards (mirroring the other tools)
+----------------------------------
+--data-used dev      requires --exploratory
+--data-used holdout  requires --n-star and refuses to run if signal trades < N*
+
+Usage
+-----
+    python tools/random_entry_baseline.py --pool pool.csv --data-used dev --exploratory \
+        --signal-col is_signal --returns-col net_r --time-col entry_time \
+        --strata-cols direction --n-reps 5000 --seed 1
+"""
+from __future__ import annotations
+
+import argparse
+
+import numpy as np
+import pandas as pd
+
+
+def check_guards(data_used: str, exploratory: bool, n_star, n_signal: int) -> None:
+    """Raise ValueError if the run is not allowed."""
+    if data_used not in ("dev", "holdout"):
+        raise ValueError("data_used must be 'dev' or 'holdout'")
+    if data_used == "dev" and not exploratory:
+        raise ValueError("refusing to run on dev data without --exploratory")
+    if data_used == "holdout":
+        if n_star is None:
+            raise ValueError("holdout run requires --n-star")
+        if n_signal < n_star:
+            raise ValueError(
+                f"refusing to peek: only {n_signal} signal trades, N* is {n_star}")
+
+
+def _stratum_ids(d: pd.DataFrame, time_col: str, strata_cols):
+    day = pd.to_datetime(d[time_col]).dt.strftime("%Y-%m-%d")
+    parts = [day] + [d[c].astype(str) for c in strata_cols]
+    key = parts[0]
+    for p in parts[1:]:
+        key = key + "|" + p
+    codes, _ = pd.factorize(key, sort=True)
+    return codes
+
+
+def baseline(pool: pd.DataFrame, signal_col: str = "is_signal",
+             returns_col: str = "net_r", time_col: str = "entry_time",
+             strata_cols=(), n_reps: int = 5000, seed: int = 0) -> dict:
+    """Run the stratified permutation test. Returns a dict of results."""
+    d = pool.copy()
+    for col in (signal_col, returns_col, time_col, *strata_cols):
+        if col not in d.columns:
+            raise ValueError(f"column '{col}' not found in pool")
+    d = d.dropna(subset=[returns_col, signal_col, time_col]).reset_index(drop=True)
+    sig = d[signal_col].astype(float).to_numpy() > 0
+    n_signal = int(sig.sum())
+    if n_signal == 0:
+        raise ValueError("no signal trades in pool (is_signal column is all zero)")
+    if n_signal == len(d):
+        raise ValueError("every pool trade is a signal trade; pool must contain "
+                         "non-signal candidates too")
+
+    sid = _stratum_ids(d, time_col, list(strata_cols))
+    order0 = np.argsort(sid, kind="stable")
+    sid = sid[order0]
+    r = d[returns_col].to_numpy(float)[order0]
+    sig = sig[order0]
+
+    n_strata = int(sid.max()) + 1
+    counts = np.bincount(sid, minlength=n_strata)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    k = np.bincount(sid, weights=sig.astype(float), minlength=n_strata).astype(int)
+    rank_in_block = np.arange(len(sid)) - starts[sid]
+    take_n = k[sid]  # how many to draw in this row's stratum
+
+    observed = float(r[sig].mean())
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_reps)
+    for i in range(n_reps):
+        u = rng.random(len(sid))
+        order = np.lexsort((u, sid))  # random order inside each stratum block
+        chosen = order[rank_in_block < take_n]
+        means[i] = r[chosen].mean()
+
+    p = (1 + int((means >= observed).sum())) / (n_reps + 1)
+    return dict(
+        n_signal=n_signal, n_pool=int(len(d)), n_strata=n_strata, n_reps=n_reps,
+        observed_mean=observed, baseline_mean=float(means.mean()),
+        baseline_sd=float(means.std(ddof=1)),
+        baseline_lo90=float(np.quantile(means, 0.05)),
+        baseline_hi90=float(np.quantile(means, 0.95)),
+        edge_vs_random=observed - float(means.mean()), p_value=float(p),
+    )
+
+
+def verdict(res: dict, alpha: float = 0.05) -> str:
+    if res["p_value"] <= alpha:
+        return f"signal beats random entries (p <= {alpha})"
+    return f"signal NOT distinguishable from random entries (p > {alpha})"
+
+
+def format_report(res: dict, alpha: float = 0.05) -> str:
+    return "\n".join([
+        f"signal trades         : {res['n_signal']}",
+        f"pool (candidates)     : {res['n_pool']}",
+        f"strata (day x extras) : {res['n_strata']}",
+        f"random draws          : {res['n_reps']}",
+        f"observed mean net R   : {res['observed_mean']:.4f}",
+        f"random-entry mean R   : {res['baseline_mean']:.4f} (SD {res['baseline_sd']:.4f})",
+        f"random 90% range      : [{res['baseline_lo90']:.4f}, {res['baseline_hi90']:.4f}]",
+        f"edge vs random        : {res['edge_vs_random']:.4f}",
+        f"p-value (one-sided)   : {res['p_value']:.4f}",
+        f"verdict               : {verdict(res, alpha)}",
+    ])
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--pool", required=True, help="CSV of ALL candidate trades")
+    ap.add_argument("--signal-col", default="is_signal")
+    ap.add_argument("--returns-col", default="net_r")
+    ap.add_argument("--time-col", default="entry_time")
+    ap.add_argument("--strata-cols", default="",
+                    help="comma-separated extra columns to match, e.g. direction")
+    ap.add_argument("--n-reps", type=int, default=5000)
+    ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data-used", required=True, choices=["dev", "holdout"])
+    ap.add_argument("--exploratory", action="store_true")
+    ap.add_argument("--n-star", type=int, default=None)
+    a = ap.parse_args(argv)
+
+    df = pd.read_csv(a.pool)
+    n_signal = int((df[a.signal_col].astype(float) > 0).sum())
+    check_guards(a.data_used, a.exploratory, a.n_star, n_signal)
+    cols = [c for c in a.strata_cols.split(",") if c]
+    res = baseline(df, a.signal_col, a.returns_col, a.time_col, cols, a.n_reps, a.seed)
+    print(format_report(res, a.alpha))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
