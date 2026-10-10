@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tools.random_entry_baseline import baseline, check_guards, verdict
+from tools.random_entry_baseline import baseline, check_guards, main, verdict
 
 
 def _pool(n_days=120, per_day=6, edge=0.0, seed=0):
@@ -111,3 +111,15 @@ def test_guard_holdout_requires_n_star_and_enough_trades():
 def test_guard_rejects_unknown_data_label():
     with pytest.raises(ValueError):
         check_guards("test", True, None, 10)
+
+
+def test_cli_guards_exit_2_and_exploratory_runs():
+    import os, tempfile
+    path = os.path.join(tempfile.mkdtemp(), "pool.csv")
+    _pool(n_days=30).to_csv(path, index=False)
+    base = ["--pool", path, "--n-reps", "20", "--seed", "1"]
+    assert main(base + ["--data-used", "dev"]) == 2                          # no --exploratory
+    assert main(base + ["--data-used", "holdout"]) == 2                      # no --n-star
+    assert main(base + ["--data-used", "holdout", "--n-star", "9999"]) == 2  # too few signals
+    assert main(base + ["--data-used", "dev", "--signal-col", "nope"]) == 2  # bad column
+    assert main(base + ["--data-used", "dev", "--exploratory"]) == 0
