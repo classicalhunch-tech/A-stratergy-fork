@@ -26,6 +26,27 @@ jobs:
       - name: Install packages (pinned, strict)
         run: pip install -r requirements.txt
 
+      # Names every missing file at once. Without this, pytest stops at the first
+      # missing file and says nothing about the others.
+      - name: 0. Toolkit files must be in the repository
+        run: |
+          missing=0
+          for f in \
+            tools/deflated_sharpe.py tools/block_bootstrap.py tools/rank_stability.py \
+            tools/bif.py tools/walk_forward.py tools/session_vs_outside.py \
+            tools/random_entry_baseline.py tools/ledger.py \
+            tests/test_deflated_sharpe.py tests/test_block_bootstrap.py \
+            tests/test_rank_stability.py tests/test_bif.py tests/test_walk_forward.py \
+            tests/test_session_vs_outside.py tests/test_random_entry_baseline.py \
+            tests/test_ledger.py; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "Add the missing files to the repository, commit and push."
+            exit 1
+          fi
+          echo "all toolkit files present"
+
       - name: 1. Toolkit tests
         run: |
           pytest -q -rs \
