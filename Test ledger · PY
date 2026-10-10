@@ -90,3 +90,21 @@ def test_cli_add_show_trials(capsys):
     assert out.strip().splitlines()[-1] == "1"
     assert main(["--path", p, "show"]) == 0
     assert "H1" in capsys.readouterr().out
+
+
+def test_cli_refuses_cleanly_with_exit_code_2(capsys):
+    p = _path()
+    add = ["--path", p, "add", "--hypothesis", "H1", "--data-used", "holdout",
+           "--coefficient", "0.1", "--se", "0.05", "--n-trades", "50"]
+    assert main(add + ["--decision", "PASS"]) == 0
+    capsys.readouterr()
+    assert main(add + ["--decision", "PASS"]) == 2          # holdout is single-use
+    assert "REFUSED" in capsys.readouterr().out
+    other = add[:4] + ["H2"] + add[5:]                       # same command, hypothesis H2
+    assert main(other + ["--decision", "MAYBE"]) == 2        # bad decision
+    assert count_trials(p) == 1                              # nothing was written
+
+
+def test_cli_trials_on_missing_file_is_zero(capsys):
+    assert main(["--path", _path(), "trials"]) == 0
+    assert capsys.readouterr().out.strip() == "0"
